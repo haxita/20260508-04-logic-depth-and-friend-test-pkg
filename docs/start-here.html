@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tier1-audit — start here</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fcfcfb;
+    --rule: #e3e0d8;
+    --code-bg: #f3f1ec;
+    --accent: #2d5a8c;
+    --warn-bg: #fff8e1;
+    --warn-rule: #d4b452;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+                 "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+    line-height: 1.65;
+    font-size: 16px;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 4rem;
+  }
+  header.cover {
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  h1 {
+    font-size: 2.05rem;
+    margin: 0 0 .35rem;
+    line-height: 1.2;
+    letter-spacing: -.01em;
+  }
+  .tagline {
+    color: var(--fg-muted);
+    margin: 0 0 .75rem;
+  }
+  .meta {
+    color: var(--fg-muted);
+    font-size: .85rem;
+    margin: 0;
+  }
+  h2 {
+    font-size: 1.35rem;
+    margin: 2.6rem 0 .8rem;
+    padding-top: .8rem;
+    border-top: 1px solid var(--rule);
+    line-height: 1.25;
+    scroll-margin-top: 1rem;
+  }
+  h2:first-of-type { border-top: none; padding-top: 0; }
+  h3 {
+    font-size: 1.05rem;
+    margin: 1.6rem 0 .5rem;
+    color: var(--accent);
+  }
+  p, li { color: var(--fg); }
+  a { color: var(--accent); text-decoration: underline; }
+  a:hover { text-decoration: none; }
+  code, pre, kbd {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 0.08em 0.35em;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.85rem 1rem;
+    border-radius: 5px;
+    overflow-x: auto;
+    line-height: 1.45;
+    border: 1px solid var(--rule);
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.94em;
+  }
+  th, td {
+    border: 1px solid var(--rule);
+    padding: 0.5rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); font-weight: 600; }
+  ul, ol { padding-left: 1.4rem; }
+  ul li, ol li { margin: .25rem 0; }
+  blockquote, .callout {
+    background: var(--warn-bg);
+    border-left: 4px solid var(--warn-rule);
+    margin: 1rem 0;
+    padding: 0.75rem 1rem;
+    border-radius: 0 4px 4px 0;
+  }
+  .callout p:first-child { margin-top: 0; }
+  .callout p:last-child { margin-bottom: 0; }
+  nav.toc {
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    padding: 0.85rem 1rem;
+    border-radius: 5px;
+    margin-bottom: 2rem;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.4rem;
+    columns: 2;
+    column-gap: 1.5rem;
+  }
+  nav.toc li { margin: 0.1rem 0; break-inside: avoid; }
+  nav.toc a { text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  footer {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--rule);
+    font-size: .9rem;
+    color: var(--fg-muted);
+  }
+  .badge {
+    display: inline-block;
+    padding: 0.1rem 0.55rem;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #fff;
+    font-size: .75rem;
+    margin-right: .35rem;
+    vertical-align: middle;
+  }
+  /* Mobile */
+  @media (max-width: 540px) {
+    main { padding: 1.5rem 1rem 3rem; }
+    h1 { font-size: 1.6rem; }
+    h2 { font-size: 1.2rem; }
+    nav.toc ol { columns: 1; }
+    pre { font-size: 0.82em; }
+  }
+  /* Print */
+  @media print {
+    body { background: #fff; font-size: 11pt; }
+    main { max-width: 100%; padding: 1cm; }
+    nav.toc { break-inside: avoid; }
+    h2 { page-break-before: always; border-top: none; }
+    h2:first-of-type { page-break-before: avoid; }
+    pre, blockquote, .callout, table { page-break-inside: avoid; }
+    a { color: var(--fg); text-decoration: none; }
+    a[href^="http"]::after { content: " (" attr(href) ")"; font-size: 0.8em; color: var(--fg-muted); }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<header class="cover">
+  <h1>tier1-audit — start here</h1>
+  <p class="tagline">A deterministic auditor for legacy <code>.xlsm</code> workbooks. Local-only. Bring your own AI (optional).</p>
+  <p class="meta">Version 0.1.0 &middot; Last updated 2026-05-09</p>
+</header>
+
+<nav class="toc" aria-label="Table of contents">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#what">What this is</a></li>
+    <li><a href="#compliance">Compliance note (for IT)</a></li>
+    <li><a href="#prereq">Prerequisites</a></li>
+    <li><a href="#track-a">Quick start (Track A)</a></li>
+    <li><a href="#track-b">Optional: Track B (LLM-enriched)</a></li>
+    <li><a href="#trouble">Troubleshooting</a></li>
+    <li><a href="#feedback-want">What feedback would help most</a></li>
+    <li><a href="#feedback-how">How to send feedback</a></li>
+    <li><a href="#thanks">Thanks &amp; expectations</a></li>
+    <li><a href="#refs">References &amp; deeper docs</a></li>
+  </ol>
+</nav>
+
+<h2 id="what">1. What this is</h2>
+<p>
+  <code>tier1-audit</code> is a static-analysis tool that reads one
+  <code>.xlsm</code> file and produces a deterministic report — pillar
+  cells, magic-number anomalies, VBA module classification, code
+  smells, complexity score. It runs entirely on your machine and makes
+  zero network calls during audit.
+</p>
+<p>
+  An optional <strong>Track B (BYOA — Bring Your Own AI)</strong> mode
+  emits a structured prompt + dossier you feed into <em>your own</em>
+  Copilot Chat or Claude session to get richer business-semantic
+  narratives. The tool itself never calls an LLM, never holds an API
+  key, and never proxies LLM traffic.
+</p>
+
+<h2 id="compliance">2. Compliance note (for IT)</h2>
+<div class="callout">
+<p><strong>If your IT or security team needs justification, the text below is copy-paste ready.</strong></p>
+<p>
+  <em>tier1-audit is a Python tool that performs static analysis of one
+  Excel workbook on the user's local machine. Specifically:</em>
+</p>
+<ul>
+  <li><em>It runs entirely local. There are no API keys, no telemetry,
+      and no network calls during audit. Verifiable by running with
+      the network disabled, or by inspecting outbound traffic with
+      Wireshark / corporate proxy logs.</em></li>
+  <li><em>The runtime depends on three open-source Python libraries,
+      each widely-deployed and permissively-licensed:</em>
+      <ul>
+        <li><em><code>openpyxl</code> (MIT) — the standard Python library
+            for reading <code>.xlsx</code>/<code>.xlsm</code> files; ~10M
+            downloads/month.</em></li>
+        <li><em><code>oletools</code> (BSD) — used by SOC analysts and
+            malware researchers for VBA extraction.</em></li>
+        <li><em><code>formulas</code> (EUPL-1.1) — Excel formula
+            tokenizer; we use the tokenizer only, no formula
+            evaluation.</em></li>
+      </ul>
+  </li>
+  <li><em>No macro is ever executed. No formula is ever evaluated. VBA
+      source is parsed as text.</em></li>
+  <li><em>Zero LLM API calls in the tool itself. Track B (optional)
+      uses the user's existing Copilot or Claude session — i.e. their
+      own pre-approved chat tool — and is a manual paste, not a network
+      call from this package. There is no <code>requests</code>,
+      <code>httpx</code>, <code>anthropic</code>, or <code>openai</code>
+      import in the source tree, and tests guard this.</em></li>
+  <li><em>All outputs land on local disk in a directory the user picks.
+      A <code>--sanitize</code> flag redacts non-formula cell values for
+      safe sharing of the report.</em></li>
+  <li><em>Source is &lt; 2,500 lines of Python under
+      <code>src/tier1_audit/</code>; auditable in an afternoon.</em></li>
+</ul>
+</div>
+
+<h2 id="prereq">3. Prerequisites</h2>
+<ul>
+  <li>Python 3.9 or newer (verify: <code>python3 --version</code>).</li>
+  <li>Git (only if you choose <code>git clone</code>; ZIP download works otherwise).</li>
+  <li>VS Code recommended for Track B; any terminal works for Track A.</li>
+</ul>
+
+<h2 id="track-a">4. Quick Start &mdash; Track A (simplest)</h2>
+<p>
+  Track A is a deterministic static audit. No LLM. No network. This is
+  the floor of capability and is recommended as your first run.
+</p>
+<pre><code># 1. Get the code (clone OR download &amp; unzip)
+git clone https://github.com/haxita/xlsm-audit.git
+cd xlsm-audit
+
+# 2. Install (creates a venv first; recommended)
+python3 -m venv .venv
+source .venv/bin/activate          # macOS/Linux
+# .venv\Scripts\Activate.ps1       # Windows PowerShell
+pip install .
+
+# 3. Run on your file
+audit-xlsm path/to/your-file.xlsm --sanitize --out-dir ./out
+
+# 4. Open the report
+open ./out/audit.html              # macOS
+# start .\out\audit.html           # Windows
+# xdg-open ./out/audit.html        # Linux</code></pre>
+
+<p>
+  The audit takes anywhere from a few seconds (small workbooks) to a
+  couple of minutes (large multi-sheet workbooks with VBA). Output
+  files land in <code>./out/</code>:
+  <code>audit.md</code>, <code>audit.html</code>, <code>audit.json</code>.
+</p>
+
+<h2 id="track-b">5. Optional &mdash; Track B (LLM-enriched audit)</h2>
+<p>
+  Track B uses your existing Copilot Chat or Claude session to produce
+  business-semantic narratives ("Implements MRP netting; hardcodes 5%
+  loss factor") instead of mechanical ones ("data-loader, 80 lines,
+  reads sheet X"). Two paths.
+</p>
+
+<h3>5a. Auto path (recommended) &mdash; Copilot custom agent</h3>
+<p>
+  This repo ships a custom Copilot agent at
+  <code>.github/agents/xlsm-audit.agent.md</code>. With the repo open in
+  VS Code:
+</p>
+<ol>
+  <li>Open Copilot Chat (<kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>I</kbd> on macOS, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>I</kbd> on Windows/Linux).</li>
+  <li>Click the agent dropdown in the chat panel and select <strong>xlsm-audit</strong>. (If the dropdown is empty, run <em>Developer: Reload Window</em> from the Command Palette.)</li>
+  <li>Type the absolute path of your <code>.xlsm</code> file and send.</li>
+  <li>Approve terminal-command prompts as they appear (Copilot will ask before each <code>audit-xlsm</code> invocation).</li>
+  <li>When done, the agent opens <code>audit-output/audit-enriched.html</code> automatically.</li>
+</ol>
+<p>
+  The agent runs the seven-step pipeline you would otherwise run by
+  hand: <code>audit-xlsm --harness</code>, read the prompt and dossier,
+  produce the JSON response, write <code>responses.json</code>, run
+  <code>audit-xlsm --ingest</code>, open the result.
+</p>
+<p class="meta">
+  Don't have Copilot in your VS Code? Use the manual fallback below.
+</p>
+
+<h3>5b. Manual path (fallback) &mdash; the original Track B flow</h3>
+<pre><code># Step 1 — extract the harness
+audit-xlsm path/to/file.xlsm --harness --out-dir ./audit-output
+
+# Step 2 — open audit-output/prompt.md, paste into Copilot Chat /
+#          Claude / ChatGPT, attach audit-output/dossier.json, copy
+#          the JSON response, save as audit-output/responses.json
+
+# Step 3 — splice the narratives back in
+audit-xlsm path/to/file.xlsm --ingest audit-output/responses.json --out-dir ./audit-output
+open ./audit-output/audit-enriched.html</code></pre>
+<p>
+  The full walkthrough lives at <code>docs/harness-guide.md</code> in
+  this repo.
+</p>
+
+<h2 id="trouble">6. Troubleshooting</h2>
+<p>If you hit a problem, please check this list before pinging me — most issues are environmental, not bugs.</p>
+
+<h3>Install issues</h3>
+
+<p><strong>1. <code>pip install .</code> fails &mdash; PyPI access blocked.</strong>
+   Inside companies with no public PyPI access, use an internal mirror:
+   <code>pip install --index-url https://&lt;INTERNAL_MIRROR&gt;/simple/ .</code>.
+   The three runtime deps (<code>openpyxl</code>, <code>oletools</code>,
+   <code>formulas</code>) are common; if they're missing from the mirror,
+   ask IT to add them. See <code>docs/friend-test-setup.md</code> Path 3.</p>
+
+<p><strong>2. Old pip rejects PEP 660 / editable install.</strong>
+   Use <code>pip install .</code> (not <code>pip install -e .</code>) —
+   the non-editable install bypasses the PEP 660 hook entirely.</p>
+
+<p><strong>3. <code>requires-python</code> mismatch.</strong>
+   The package needs Python 3.9+. If your machine has Python 3.8 or older,
+   install Python 3.9+ side-by-side and use it for the venv:
+   <code>python3.9 -m venv .venv</code>.</p>
+
+<p><strong>4. <code>git clone</code> is blocked.</strong>
+   Download the repo as a ZIP from GitHub (Code → Download ZIP), unzip,
+   and run <code>pip install .</code> from the unzipped folder.</p>
+
+<p><strong>5. SSL cert verify failures (corporate MITM proxy).</strong>
+   Set <code>HTTPS_PROXY</code> / <code>HTTP_PROXY</code> env vars or
+   pass <code>--proxy http://corp.proxy:port</code> to pip. If the proxy
+   uses a self-signed cert, ask IT to add it to the system trust store
+   or use <code>--trusted-host</code>.</p>
+
+<p><strong>6. PowerShell &quot;running scripts is disabled&quot;.</strong>
+   On Windows: <code>Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned</code>,
+   then re-activate the venv. Reversible, current-user only.</p>
+
+<h3>Run-time issues</h3>
+
+<p><strong>7. Audit crashes with &quot;Failed to extract VBA macros&quot;.</strong>
+   The file is encrypted / password-protected. Either Save As without
+   password in Excel and re-run, or install <code>msoffcrypto-tool</code>
+   separately, decrypt the workbook, and run audit on the decrypted
+   copy. Encrypted-xlsm support is not yet built in.</p>
+
+<p><strong>8. <code>ImportError: cannot import name 'X' from 'numpy'</code>.</strong>
+   Pre-installed numpy mismatched with <code>formulas</code>. Run
+   <code>pip install --upgrade --force-reinstall numpy formulas</code>
+   inside the venv.</p>
+
+<p><strong>9. Mermaid diagrams don't render in <code>audit.html</code>.</strong>
+   The default HTML references the public Mermaid CDN at view time. If
+   your machine has no internet at view time, re-run with
+   <code>--mermaid-inline</code> to embed the JS into the file.</p>
+
+<p><strong>10. Path-too-long on Windows (deep OneDrive folders).</strong>
+   Copy the <code>.xlsm</code> to a shorter path
+   (e.g. <code>C:\Temp\file.xlsm</code>) and audit from there.</p>
+
+<h3>Track B / agent issues</h3>
+
+<p><strong>11. Copilot Chat doesn't show the <em>xlsm-audit</em> agent in the dropdown.</strong>
+   Ensure the repo is opened in VS Code (not just an arbitrary folder) so
+   <code>.github/agents/xlsm-audit.agent.md</code> is in the workspace.
+   Then run <em>Developer: Reload Window</em> from the Command Palette.</p>
+
+<p><strong>12. Copilot returns prose instead of JSON.</strong>
+   Some models drop earlier instructions on long prompts. Either: (a)
+   re-prompt with &quot;Output ONLY a single top-level JSON object, no
+   markdown fences&quot;; or (b) fall back to the manual Track B path
+   (Section 5b) — the <code>--ingest</code> step tolerates partial
+   responses and gracefully degrades unfilled markers.</p>
+
+<p><strong>13. Agent stalls mid-flow / refuses a step.</strong>
+   Tell the agent &quot;continue from step N&quot;. If it still stalls,
+   switch to the manual path. The manual flow is the always-works floor.</p>
+
+<p><strong>14. Company computer blocks all third-party Python.</strong>
+   The audit tool can be inspected and run as a single set of plain
+   <code>.py</code> files (no compiled extensions beyond the standard
+   wheel for <code>cryptography</code>, a transitive dep of
+   <code>oletools</code>). If you can't install at all, the
+   <code>audit.json</code> output of a colleague's run is still useful
+   raw data you can review.</p>
+
+<h2 id="feedback-want">7. What feedback would help most</h2>
+<p>
+  Quantitative bug reports are welcome but the most useful feedback is
+  <strong>qualitative reactions to the report's content</strong>. In
+  rough priority order:
+</p>
+<ul>
+  <li><strong>Workflow Guide accuracy</strong> &mdash; does the auto-generated
+      "what this workbook is for / how it's used" section match how you
+      actually use the file? If not, where does it go wrong?</li>
+  <li><strong>Pillar cells</strong> &mdash; did the inline value+label
+      identify cells you yourself would have flagged as critical? Any
+      obvious ones it missed?</li>
+  <li><strong>Domain template hits</strong> &mdash; was
+      <em>capacity-planning</em> / <em>logistics-routing</em> /
+      <em>inventory-supply-chain</em> correctly detected? If miscategorised,
+      what would you have called it?</li>
+  <li><strong>Track A vs Track B</strong> &mdash; if you tried both, was
+      the LLM-enrichment worth the friction? Did the auto-agent path or
+      the manual path work better for you?</li>
+  <li><strong>False alarms</strong> &mdash; any findings that are noise
+      we should suppress? Concrete examples (sheet name + finding type)
+      help most.</li>
+  <li><strong>Blind spots</strong> &mdash; any real risks the audit missed?
+      Worth a callout even if you can't say exactly what would catch them.</li>
+  <li><strong>Install pain</strong> &mdash; which path in
+      <code>docs/friend-test-setup.md</code> worked / didn't / should be
+      easier?</li>
+</ul>
+
+<h2 id="feedback-how">8. How to send feedback</h2>
+<p>
+  Two channels, in order of preference:
+</p>
+<ul>
+  <li>
+    <strong>GitHub Issues</strong> at
+    <code>https://github.com/haxita/xlsm-audit/issues</code> &mdash;
+    pulse-checked. Best for "here's a concrete bug or noise example".
+    Paste a snippet from a <code>--sanitize</code>-mode <code>audit.md</code>;
+    don't paste the original workbook.
+  </li>
+  <li>
+    <strong>Direct to Michael</strong> &mdash; via whatever channel you
+    already have. Best for qualitative reactions, half-formed thoughts,
+    "this didn't feel right but I'm not sure why" comments.
+  </li>
+</ul>
+<p>
+  <strong>Please don't send the original <code>.xlsm</code> file.</strong>
+  We don't need it. The <code>audit.md</code> excerpt or
+  <code>audit.json</code> is sufficient. <code>--sanitize</code> exists
+  precisely for this case.
+</p>
+
+<h2 id="thanks">9. Thanks &amp; expectations</h2>
+<p>
+  This is a beta. The tool will be wrong about things; the agent flow
+  may stall on your first try; the install may want a Path 2 instead of
+  a Path 1. None of that is wasted — every reproducible thing you can
+  send back becomes a fix or a doc clarification, which is the entire
+  point of this round of friend-testing. Half-tested vague reports
+  (&quot;the X felt off&quot;) are better than no report.
+</p>
+
+<h2 id="refs">10. References &amp; deeper docs</h2>
+<ul>
+  <li><a href="../README.md">README.md</a> &mdash; product overview and feature list.</li>
+  <li><a href="./friend-test-setup.md">friend-test-setup.md</a> &mdash; the four install paths in detail (Path 1 default, Path 2 modern pip, Path 3 internal mirror, Path 4 corporate proxy).</li>
+  <li><a href="./harness-guide.md">harness-guide.md</a> &mdash; the manual Track B walkthrough in full.</li>
+  <li><a href="./output-sample.md">output-sample.md</a> &mdash; what a real Track A report looks like.</li>
+</ul>
+
+<footer>
+  <p>tier1-audit &middot; v0.1.0 &middot; Apache-2.0 &middot; 2026-05-09</p>
+</footer>
+
+</main>
+</body>
+</html>

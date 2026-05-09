@@ -101,6 +101,24 @@ For corporate / sealed-network installs, see `docs/friend-test-setup.md`
 which covers four install paths (default `pip install .`, GitHub direct,
 internal Artifactory/Nexus mirror, corporate proxy).
 
+### Friend onboarding — start here
+
+If you're trying this for the first time, open
+[`docs/start-here.html`](docs/start-here.html) in any browser. It's a
+single self-contained page with the install steps, the IT compliance
+copy-paste, the auto-agent flow (Track B via VS Code Copilot custom
+agent), and a thorough troubleshooting section.
+
+### One-prompt LLM enrichment via VS Code Copilot
+
+If your VS Code has GitHub Copilot Chat, this repo ships
+`.github/agents/xlsm-audit.agent.md` — a custom Copilot agent that
+runs the full Track B pipeline from a single chat prompt. Open Copilot
+Chat → agent dropdown → **xlsm-audit** → type the file path. The agent
+runs `--harness`, fills the BYOA harness using the model in your chat,
+runs `--ingest`, and opens `audit-enriched.html`. The tool itself never
+calls an LLM; the LLM tokens come from your existing Copilot session.
+
 ## Privacy
 
 ```bash
