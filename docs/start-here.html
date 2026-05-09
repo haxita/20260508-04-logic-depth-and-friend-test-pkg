@@ -295,21 +295,42 @@ open ./out/audit.html              # macOS
 <p>
   This repo ships a custom Copilot agent at
   <code>.github/agents/xlsm-audit.agent.md</code>. With the repo open in
-  VS Code:
+  VS Code, the whole Track B flow becomes <strong>one chat message</strong>.
 </p>
+
+<h4>What you do</h4>
 <ol>
   <li>Open Copilot Chat (<kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>I</kbd> on macOS, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>I</kbd> on Windows/Linux).</li>
-  <li>Click the agent dropdown in the chat panel and select <strong>xlsm-audit</strong>. (If the dropdown is empty, run <em>Developer: Reload Window</em> from the Command Palette.)</li>
-  <li>Type the absolute path of your <code>.xlsm</code> file and send.</li>
+  <li>Click the agent dropdown in the chat panel and select <strong>xlsm-audit</strong>. (If the dropdown is empty, run <em>Developer: Reload Window</em> from the Command Palette and re-check.)</li>
+  <li>Send a message with your <code>.xlsm</code> file path. Examples:
+    <ul>
+      <li><code>/path/to/your-file.xlsm</code></li>
+      <li><code>audit /Users/me/Downloads/capacity.xlsm with sanitize</code></li>
+      <li><code>~/Documents/scheduling.xlsm</code></li>
+    </ul>
+  </li>
   <li>Approve terminal-command prompts as they appear (Copilot will ask before each <code>audit-xlsm</code> invocation).</li>
-  <li>When done, the agent opens <code>audit-output/audit-enriched.html</code> automatically.</li>
 </ol>
-<p>
-  The agent runs the seven-step pipeline you would otherwise run by
-  hand: <code>audit-xlsm --harness</code>, read the prompt and dossier,
-  produce the JSON response, write <code>responses.json</code>, run
-  <code>audit-xlsm --ingest</code>, open the result.
-</p>
+
+<h4>What the agent does (so you know what's happening)</h4>
+<p>The agent works through a fixed 7-step pipeline. Roughly what you'll see in chat:</p>
+<ol>
+  <li><strong>Step 1: Verify</strong> &mdash; runs <code>audit-xlsm --version</code>. If the CLI isn't installed, the agent stops and asks you to <code>pip install .</code> in the repo root.</li>
+  <li><strong>Step 2: Extract</strong> &mdash; runs <code>audit-xlsm "&lt;file&gt;" --harness --out-dir ./audit-output</code>. You'll see the printout <code>harness  : dossier.json + prompt.md (N marker(s) to fill)</code>. Typical N: 15-30.</li>
+  <li><strong>Step 3: Read prompt</strong> &mdash; the agent reads <code>audit-output/prompt.md</code>. This is the same prompt the manual flow asks you to paste into Copilot Chat &mdash; the agent reads it as instructions for itself.</li>
+  <li><strong>Step 4: Read dossier</strong> &mdash; the agent reads <code>audit-output/dossier.json</code>: full VBA source, sheet samples, pillars, smells. This is its evidence base.</li>
+  <li><strong>Step 5: Generate JSON</strong> &mdash; the agent (Sonnet 4.6 or whichever model you have) writes 2-4 sentence narratives for each marker ID. This is the slow step (10-60 seconds depending on model and marker count).</li>
+  <li><strong>Step 6: Ingest</strong> &mdash; writes <code>responses.json</code>, validates with a quick <code>python -c</code>, then runs <code>audit-xlsm --ingest</code>. You'll see <code>replaced     : N marker(s)</code> &mdash; ideally close to the N from step 2; some markers may be skipped if the agent felt evidence was thin.</li>
+  <li><strong>Step 7: Open</strong> &mdash; runs <code>open audit-output/audit-enriched.html</code> on macOS (prints path on Windows/Linux). Then summarises for you in chat: complexity score, fill rate, top finding.</li>
+</ol>
+
+<h4>Where this can hiccup</h4>
+<ul>
+  <li>If the agent dropdown is empty or doesn't show <strong>xlsm-audit</strong> &mdash; reload window, re-open repo. If still nothing, your VS Code Copilot version may be older than agent-mode support.</li>
+  <li>If Copilot wraps its JSON in <code>```json ... ```</code> fences or adds a preamble &mdash; the agent's hard rules tell it to output <em>JSON only</em>, but models sometimes ignore that. The validation at Step 6 will catch malformed JSON; the agent will retry.</li>
+  <li>If the model gives <code>null</code> for too many markers (no evidence), the heuristic narratives stay in place &mdash; you still get a valid (if less rich) audit-enriched.html.</li>
+</ul>
+
 <p class="meta">
   Don't have Copilot in your VS Code? Use the manual fallback below.
 </p>
@@ -328,6 +349,56 @@ open ./audit-output/audit-enriched.html</code></pre>
 <p>
   The full walkthrough lives at <code>docs/harness-guide.md</code> in
   this repo.
+</p>
+
+<h3>5c. Concrete example &mdash; Track A vs Track B side by side</h3>
+<p>
+  We verified Track B end-to-end on the <code>logistics_routing_synth.xlsm</code>
+  fixture (the synthetic logistics-routing workbook in this repo's tests).
+  The actual enriched outputs are committed at
+  <code>docs/example-enriched-audit.{md,html}</code>
+  (<a href="example-enriched-audit.html">open the HTML directly</a>) and
+  the LLM responses that produced them are at
+  <code>docs/example-llm-responses.json</code>.
+</p>
+<p>
+  Here's the same sheet narrated by Track A vs Track B:
+</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Track A (heuristic)</th><th>Track B (LLM-enriched)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Routes sheet</strong></td>
+      <td>
+        <em>computed sheet — populated by formulas with cross-sheet lookups.
+        Sources: Shipments(30), Vehicles(30). Pillars: 60 cells.</em>
+      </td>
+      <td>
+        Route master table — one row per delivery route. The capacity-utilization
+        formula in column F implements a <strong>classic VRP feasibility check</strong>:
+        SUMIFS(Shipments.weight, route_id) / VLOOKUP(vehicle, Vehicles, capacity) —
+        values &gt; 1.0 indicate overpacked routes. Derived sheet that depends
+        transitively on Shipments and Vehicles; <strong>never the source of truth</strong>.
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  Notice the difference: Track A reports facts, Track B identifies the
+  <strong>VRP feasibility check</strong> — an academic-routing concept — and
+  warns about the dependency direction. That's the kind of business-semantic
+  narrative that makes the audit useful to people who didn't write the workbook.
+</p>
+
+<p class="meta">
+  Successful CLI output you should see:
+  <code>replaced     : 13 marker(s)</code> +
+  <code>kept (heur.) : 7 marker(s) with no LLM response — heuristic narrative kept</code>.
+  Partial fill is normal — the model is told to skip markers it can't ground in evidence.
 </p>
 
 <h2 id="trouble">6. Troubleshooting</h2>
@@ -413,6 +484,49 @@ open ./audit-output/audit-enriched.html</code></pre>
    <code>audit.json</code> output of a colleague's run is still useful
    raw data you can review.</p>
 
+<p><strong>15. <code>--ingest</code> says <code>replaced     : 0 marker(s)</code>.</strong>
+   The keys in your <code>responses.json</code> don't match any marker
+   IDs in <code>audit.md</code>. Common causes: (a) JSON keys are wrapped
+   with extra quoting (<code>"\"vba-narration:Foo\""</code> instead of
+   <code>"vba-narration:Foo"</code>); (b) IDs were truncated by a model
+   that decided to abbreviate; (c) you ran <code>--ingest</code> on a
+   different workbook than <code>--harness</code>. Compare the keys in
+   your <code>responses.json</code> to the <code>### \`marker-id\`</code>
+   headings in <code>prompt.md</code>.</p>
+
+<p><strong>16. <code>--ingest</code> errors with <code>json.JSONDecodeError: ... line N col M</code>.</strong>
+   The CLI prints the file path and the exact parse position. Most often
+   it's a trailing comma after the last key, or a missing comma between
+   keys. Open <code>responses.json</code> in any editor with JSON support
+   (VS Code's built-in is fine) and look for the squiggle.</p>
+
+<p><strong>17. The Copilot agent dropdown shows <em>xlsm-audit</em> but selecting it does nothing.</strong>
+   Some Copilot versions need the agent file to be saved AND the workspace
+   reloaded after first commit. <em>File → Revert File</em> on
+   <code>.github/agents/xlsm-audit.agent.md</code>, then reload window.
+   If still inert, use the manual Track B path (Section 5b) — same
+   end result, just more keystrokes.</p>
+
+<p><strong>18. Output suddenly looks completely different on a re-run.</strong>
+   It shouldn't — same input always yields byte-identical output by
+   design. If you see a real diff, something is non-deterministic
+   (file system order, environment) — please send me the two outputs
+   and the input file and we'll fix the regression.</p>
+
+<p><strong>19. You want to run audit on multiple workbooks at once.</strong>
+   Not yet supported as a single batch command. Workaround:
+   <code>for f in *.xlsm; do audit-xlsm "$f" --out-dir "audit-$(basename "$f" .xlsm)"; done</code>
+   from a bash shell. Each workbook gets its own out-dir.</p>
+
+<p><strong>20. The <code>docs/example-enriched-audit.html</code> file in this repo —
+   what is it?</strong>
+   It's the verified Track B output we ran on the
+   <code>logistics_routing_synth.xlsm</code> fixture, frozen as a
+   reference. Open it to see what a successful enriched audit looks
+   like before you run your own. The accompanying
+   <code>example-llm-responses.json</code> is the model output that
+   produced it.</p>
+
 <h2 id="feedback-want">7. What feedback would help most</h2>
 <p>
   Quantitative bug reports are welcome but the most useful feedback is
@@ -484,6 +598,10 @@ open ./audit-output/audit-enriched.html</code></pre>
   <li><a href="./friend-test-setup.md">friend-test-setup.md</a> &mdash; the four install paths in detail (Path 1 default, Path 2 modern pip, Path 3 internal mirror, Path 4 corporate proxy).</li>
   <li><a href="./harness-guide.md">harness-guide.md</a> &mdash; the manual Track B walkthrough in full.</li>
   <li><a href="./output-sample.md">output-sample.md</a> &mdash; what a real Track A report looks like.</li>
+  <li><a href="./test-corpus.md">test-corpus.md</a> &mdash; the 6-fixture regression baseline that this tool is tested against (capacity-planning, logistics-routing, inventory-supply-chain, plus a minimal degradation case).</li>
+  <li><a href="./example-enriched-audit.html">example-enriched-audit.html</a> &mdash; a frozen, verified Track B output on the logistics fixture. Open it before running your own to see what a successful enriched audit looks like.</li>
+  <li><a href="./example-llm-responses.json">example-llm-responses.json</a> &mdash; the model output that produced the example enriched audit. Useful as a reference if you're debugging your own ingest step.</li>
+  <li><code>../research/agent-harness-research.md</code> &mdash; the research note that informed this repo's hybrid Copilot + Claude Code agent layout.</li>
 </ul>
 
 <footer>
