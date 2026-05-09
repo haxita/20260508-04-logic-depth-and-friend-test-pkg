@@ -32,9 +32,25 @@ markdown + JSON report that explains:
 This is the **Tier 1** capability of a tiered offering. Tier 1 is structural
 and statistical only — no AI, no semantic interpretation. The audit
 deliberately stops at "here are the facts, ranked"; humans decide what to
-do with them. (Future Tier 1.5 adds LLM-augmented semantic explanation
-under a Bring-Your-Own-Account model — your Copilot or Claude CLI, not
-ours.)
+do with them.
+
+### Two-track architecture
+
+The same audit pipeline can be run in either of two modes:
+
+- **Track A — zero-LLM (default)**: pure static analysis. Heuristic narrative
+  templates throughout. Always available, even on networks where LLM use is
+  prohibited.
+- **Track B — BYOA harness (opt-in)**: tool emits `dossier.json` + `prompt.md`.
+  You paste them into your own Copilot Chat / Claude / ChatGPT. LLM responds
+  with JSON. You save it as `responses.json` and run `--ingest`. Tool produces
+  `audit-enriched.{md,html}` with the LLM's semantic narratives spliced in
+  at every `<!-- LLM-AUGMENT: ID -->` marker.
+
+  Critically: **the tool itself NEVER calls an LLM**. We don't pay tokens, we
+  don't proxy LLM traffic, we don't import any LLM SDK. Your keystrokes into
+  Copilot Chat are YOUR keyboard activity, not a network call from this tool.
+  See `docs/harness-guide.md` for the friend-actionable walkthrough.
 
 ## Quick start
 
@@ -63,6 +79,23 @@ Want fully offline HTML (no Mermaid CDN at view time)?
 ```bash
 audit-xlsm file.xlsm --mermaid-inline
 ```
+
+### Track B (BYOA harness): semantic narratives via your own LLM
+
+```bash
+# Step 1: extract — produces dossier.json + prompt.md alongside audit.*
+audit-xlsm file.xlsm --harness --out-dir ./audit-output
+
+# Step 2: open audit-output/prompt.md, paste into VS Code Copilot Chat / Claude
+#         Desktop / ChatGPT, attach dossier.json, copy the JSON response, save
+#         as audit-output/responses.json
+
+# Step 3: ingest — splices the LLM narratives into audit-enriched.{md,html}
+audit-xlsm file.xlsm --ingest audit-output/responses.json --out-dir ./audit-output
+open audit-output/audit-enriched.html
+```
+
+Full walkthrough: `docs/harness-guide.md`.
 
 For corporate / sealed-network installs, see `docs/friend-test-setup.md`
 which covers four install paths (default `pip install .`, GitHub direct,
