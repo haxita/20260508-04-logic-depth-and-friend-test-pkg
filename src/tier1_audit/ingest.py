@@ -42,25 +42,20 @@ _RE_MD_MARKER_ANY = re.compile(r"<!--\s*LLM-AUGMENT:\s*([^\s][^>]*?)\s*-->")
 # Loading + validating the user's JSON
 # =============================================================================
 
-def load_responses(path) -> dict:
-    """Read responses.json and return {id: narrative}. Validates structure.
+_SUPPORTED_LANGS_INGEST = ("en", "de", "zh")
 
-    Raises SystemExit with a helpful message on malformed JSON. Strips
-    common pitfalls: leading/trailing whitespace per value, empty narratives,
-    non-string values.
-    """
+
+def _read_responses_raw(path) -> dict:
+    """Internal: read JSON file, strip optional ```json fences, return dict."""
     p = Path(path)
     if not p.exists():
         raise SystemExit(f"FATAL: responses file not found: {p}")
     raw = p.read_text(encoding="utf-8")
-    # Tolerate the LLM accidentally wrapping output in ```json ... ``` fences.
     stripped = raw.strip()
     if stripped.startswith("```"):
-        # Strip first fence line and last fence line
         lines = stripped.splitlines()
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
-        # Drop trailing fence
         while lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
@@ -79,7 +74,75 @@ def load_responses(path) -> dict:
             f"FATAL: responses file must be a JSON OBJECT (dict), got "
             f"{type(data).__name__}: {p}"
         )
-    # Coerce values to stripped strings; drop empties/non-strings (logged).
+    return data
+
+
+def detect_responses_shape(data: dict) -> str:
+    """Inspect the parsed responses dict and decide whether it's the flat
+    or nested (trilingual) shape.
+
+    Returns "flat" if values are strings, "nested" if any value is a dict
+    with at least one of {en, de, zh} keys. Raises SystemExit if the shape
+    is ambiguous (e.g. mixed flat + nested).
+    """
+    has_flat = False
+    has_nested = False
+    for v in data.values():
+        if isinstance(v, str):
+            has_flat = True
+        elif isinstance(v, dict):
+            if any(k in v for k in _SUPPORTED_LANGS_INGEST):
+                has_nested = True
+    if has_nested and not has_flat:
+        return "nested"
+    if has_flat and not has_nested:
+        return "flat"
+    if not has_flat and not has_nested:
+        # Empty or all-invalid — treat as flat for legacy behaviour
+        return "flat"
+    # Mixed: error out
+    raise SystemExit(
+        "FATAL: responses.json mixes flat (string) and nested ({en,de,zh}) "
+        "values. Please pick ONE shape: either every value is a single "
+        "narrative string, or every value is a {\"en\":..., \"de\":..., "
+        "\"zh\":...} object."
+    )
+
+
+def load_responses(path) -> dict:
+    """Read responses.json and return flat {id: narrative}. Validates structure.
+
+    Backwards-compatible loader: accepts the legacy flat shape and silently
+    flattens the trilingual shape to the EN field (for callers that only
+    care about a single language). New callers should use
+    `load_responses_per_lang()` for full trilingual support.
+    """
+    data = _read_responses_raw(path)
+    shape = detect_responses_shape(data)
+
+    if shape == "flat":
+        return _clean_flat(data)
+    # Nested: collapse to EN by default
+    per_lang = _clean_nested(data)
+    return per_lang.get("en", {})
+
+
+def load_responses_per_lang(path) -> dict:
+    """Read responses.json and return {lang: {id: narrative}, ...}.
+
+    For the legacy flat shape, returns {"en": {id: narrative}} only.
+    For the trilingual nested shape, returns one sub-dict per language
+    actually present in the file (any of {en, de, zh}). Missing language
+    keys are silently dropped.
+    """
+    data = _read_responses_raw(path)
+    shape = detect_responses_shape(data)
+    if shape == "flat":
+        return {"en": _clean_flat(data)}
+    return _clean_nested(data)
+
+
+def _clean_flat(data: dict) -> dict:
     cleaned: dict = {}
     skipped: list = []
     for k, v in data.items():
@@ -98,6 +161,41 @@ def load_responses(path) -> dict:
         for msg in skipped:
             print(f"WARN: responses.json: skipped {msg}", file=sys.stderr)
     return cleaned
+
+
+def _clean_nested(data: dict) -> dict:
+    """Walk the nested {id: {en, de, zh}} shape, return {lang: {id: text}}."""
+    out: dict = {lang: {} for lang in _SUPPORTED_LANGS_INGEST}
+    skipped: list = []
+    for k, v in data.items():
+        if not isinstance(k, str):
+            skipped.append(f"non-string key {k!r}")
+            continue
+        if not isinstance(v, dict):
+            skipped.append(
+                f"key {k!r}: value type {type(v).__name__} "
+                f"(expected object {{en, de, zh}})"
+            )
+            continue
+        for lang in _SUPPORTED_LANGS_INGEST:
+            if lang not in v:
+                continue
+            tv = v[lang]
+            if not isinstance(tv, str):
+                skipped.append(
+                    f"key {k!r}/{lang}: value type {type(tv).__name__} "
+                    f"(expected string)"
+                )
+                continue
+            s = tv.strip()
+            if not s:
+                skipped.append(f"key {k!r}/{lang}: empty narrative")
+                continue
+            out[lang][k] = s
+    if skipped:
+        for msg in skipped:
+            print(f"WARN: responses.json: skipped {msg}", file=sys.stderr)
+    return out
 
 
 # =============================================================================
@@ -311,16 +409,165 @@ def substitute_markers_html(audit_html_text: str, responses: dict) -> tuple:
 # Public entry point
 # =============================================================================
 
-def ingest(audit_md_path, audit_html_path, responses_path,
-           out_md_path, out_html_path) -> dict:
-    """Ingest LLM responses into audit.md / audit.html.
+def ingest(audit_dir=None, responses_path=None, lang: str = "en",
+           # Legacy single-path signature kept for back-compat with callers
+           # that pass the four explicit paths (the older test harness used
+           # this shape):
+           audit_md_path=None, audit_html_path=None,
+           out_md_path=None, out_html_path=None) -> dict:
+    """Ingest LLM responses into one or more enriched audit outputs.
 
-    Args are paths (str or Path). Returns a stats dict combining markdown +
-    html substitution outcomes.
+    Two call shapes are supported:
 
-    audit_html_path / out_html_path may be None — in which case only md
-    is processed.
+    1) New (recommended): pass `audit_dir` + `responses_path` + `lang`.
+       The function locates audit.md / audit.html under `audit_dir` (or
+       under `audit_dir/<lang>/` when `lang == "all"` and a tree exists)
+       and writes audit-enriched.* (single-lang) or
+       audit-enriched.{en,de,zh}.* (trilingual) into the same directory.
+
+    2) Legacy (back-compat): pass the four explicit paths
+       `audit_md_path`, `audit_html_path`, `out_md_path`, `out_html_path`.
+       Behaves exactly like before — single language, flat responses
+       collapsed via `load_responses()`.
+
+    Returns a stats dict.
+
+    Trilingual ingest semantics:
+      - If responses.json has the nested {id: {en, de, zh}} shape:
+          * `lang == "all"`  → produce three enriched outputs
+            (`audit-enriched.{en,de,zh}.{md,html}`)
+          * `lang == "en"|"de"|"zh"` → produce one enriched output for that
+            language only
+      - If responses.json is flat (legacy {id: string}):
+          * Produce one `audit-enriched.{md,html}` regardless of `lang`
+            (back-compat — single language inferred from the file).
+
+    Missing markers in a given language fall back to that language's
+    heuristic narrative (NOT to English heuristic) — the substitution runs
+    against the audit.md rendered in the corresponding language.
     """
+    # === Legacy path: explicit four-path signature ===
+    if audit_md_path is not None:
+        return _ingest_legacy(
+            audit_md_path, audit_html_path, responses_path,
+            out_md_path, out_html_path,
+        )
+
+    # === New path: audit_dir + lang ===
+    if audit_dir is None:
+        raise TypeError("ingest() requires audit_dir or audit_md_path")
+    audit_dir = Path(audit_dir)
+    if responses_path is None:
+        raise TypeError("ingest() requires responses_path")
+    responses_path = Path(responses_path)
+
+    per_lang = load_responses_per_lang(responses_path)
+    is_nested = set(per_lang.keys()) <= {"en", "de", "zh"} and (
+        len(per_lang) > 1 or any(k != "en" for k in per_lang)
+    )
+
+    # Resolve which langs to actually emit
+    if lang == "all":
+        if not is_nested:
+            # Flat input but user asked for "all" — produce only the EN copy
+            target_langs = ["en"]
+        else:
+            target_langs = [l for l in ("en", "de", "zh") if l in per_lang]
+    else:
+        target_langs = [lang]
+
+    # For each target lang, locate the source audit.md/.html and substitute.
+    # Source layout:
+    #   - if audit_dir/audit.md exists  → single-lang tree (legacy shape)
+    #   - if audit_dir/<lang>/audit.md exists → trilingual tree (--lang all)
+    entries: list = []
+    for tl in target_langs:
+        # Find source dir
+        if (audit_dir / tl / "audit.md").exists():
+            src_dir = audit_dir / tl
+            out_dir_for_lang = audit_dir / tl
+        elif (audit_dir / "audit.md").exists():
+            src_dir = audit_dir
+            out_dir_for_lang = audit_dir
+        else:
+            raise FileNotFoundError(
+                f"--ingest could not find audit.md under {audit_dir} "
+                f"or {audit_dir / tl}. Run audit-xlsm first to produce the "
+                f"audit, then ingest."
+            )
+
+        # Output filenames: trilingual gets per-lang suffix; single-lang
+        # uses legacy `audit-enriched.{md,html}` form.
+        is_trilingual_output = (lang == "all") or (lang == tl and is_nested
+                                                   and len(target_langs) == 1
+                                                   and tl != "en")
+        # Simpler rule: when input was nested AND lang=="all", three files;
+        # otherwise single legacy filename.
+        if lang == "all" and is_nested:
+            out_md = out_dir_for_lang / f"audit-enriched.{tl}.md"
+            out_html = (out_dir_for_lang / f"audit-enriched.{tl}.html") if (src_dir / "audit.html").exists() else None
+        else:
+            out_md = out_dir_for_lang / "audit-enriched.md"
+            out_html = (out_dir_for_lang / "audit-enriched.html") if (src_dir / "audit.html").exists() else None
+
+        responses_for_lang = per_lang.get(tl, {})
+        entry = _ingest_one_lang(
+            src_md=src_dir / "audit.md",
+            src_html=(src_dir / "audit.html") if (src_dir / "audit.html").exists() else None,
+            responses=responses_for_lang,
+            out_md=out_md,
+            out_html=out_html,
+        )
+        entry["lang"] = tl
+        entries.append(entry)
+
+    return {
+        "lang": lang,
+        "shape": "nested" if is_nested else "flat",
+        "entries": entries,
+    }
+
+
+def _ingest_one_lang(src_md, src_html, responses: dict, out_md, out_html) -> dict:
+    """Substitute markers in one (md, optional html) source pair and write
+    enriched outputs. Returns a per-language stats entry."""
+    src_md = Path(src_md)
+    if not src_md.exists():
+        raise SystemExit(f"FATAL: audit.md not found: {src_md}")
+    md_text = src_md.read_text(encoding="utf-8")
+    new_md, md_stats = substitute_markers(md_text, responses)
+    out_md = Path(out_md)
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_md.write_text(new_md, encoding="utf-8")
+    for mid in md_stats["kept_heuristic"]:
+        print(f"INFO: marker '{mid}' had no LLM response — keeping heuristic narrative",
+              file=sys.stderr)
+    for mid in md_stats["unused_responses"]:
+        print(f"INFO: ignored unused response key '{mid}' (not present in audit.md)",
+              file=sys.stderr)
+    html_stats = None
+    if src_html is not None and out_html is not None:
+        src_html = Path(src_html)
+        if src_html.exists():
+            html_text = src_html.read_text(encoding="utf-8")
+            new_html, html_stats = substitute_markers_html(html_text, responses)
+            out_html = Path(out_html)
+            out_html.parent.mkdir(parents=True, exist_ok=True)
+            out_html.write_text(new_html, encoding="utf-8")
+    return {
+        "md_path": str(out_md),
+        "html_path": str(out_html) if out_html else None,
+        "md_replaced": md_stats["replaced"],
+        "md_kept_heuristic": md_stats["kept_heuristic"],
+        "md_unused_responses": md_stats["unused_responses"],
+        "html_replaced": (html_stats or {}).get("replaced"),
+    }
+
+
+def _ingest_legacy(audit_md_path, audit_html_path, responses_path,
+                   out_md_path, out_html_path) -> dict:
+    """Legacy ingest signature — kept for callers that pass explicit
+    md/html/out paths (e.g. tests). Always uses flat responses."""
     md_path = Path(audit_md_path)
     if not md_path.exists():
         raise SystemExit(f"FATAL: audit.md not found: {md_path}")
@@ -333,7 +580,6 @@ def ingest(audit_md_path, audit_html_path, responses_path,
     out_md.parent.mkdir(parents=True, exist_ok=True)
     out_md.write_text(new_md, encoding="utf-8")
 
-    # Log graceful-degradation events
     for mid in md_stats["kept_heuristic"]:
         print(f"INFO: marker '{mid}' had no LLM response — keeping heuristic narrative",
               file=sys.stderr)

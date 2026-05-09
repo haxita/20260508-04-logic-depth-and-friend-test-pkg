@@ -572,6 +572,41 @@ Your output will be ingested back into the audit by a deterministic substitution
 step. You must follow the output format EXACTLY.
 """
 
+
+# Glossary embedded into the prompt for DE/ZH consistency.
+_PROMPT_GLOSSARY = """\
+## Trilingual glossary — non-negotiable terminology
+
+When producing German or Chinese narratives, use the canonical translations
+below verbatim. When a term not in this table appears, prefer
+SAP / manufacturing-industry-standard German or mainland Chinese conventions.
+When uncertain, keep the English term in parentheses (e.g. "Stückliste (BOM)").
+
+| English | German | Chinese |
+|---|---|---|
+| capacity planning | Kapazitätsplanung | 产能规划 |
+| Bill of Materials | Stückliste | 物料清单 |
+| MRP (Material Requirements Planning) | Materialbedarfsplanung | 物料需求计划 |
+| MPS (Master Production Schedule) | Hauptproduktionsplan | 主生产计划 |
+| pillar cell (high fan-in change point) | systemrelevante Zelle | 支柱单元格 |
+| fan-in | Eingangsgrad / Referenzanzahl | 引用数(被引用次数) |
+| smell | Code-Geruch | 代码异味 |
+| anomaly | Anomalie | 异常 |
+| heuristic | Heuristik | 启发式 |
+| lead time | Lieferzeit / Vorlaufzeit | 提前期 |
+| safety stock | Sicherheitsbestand | 安全库存 |
+| hardcoded magic number | hartkodierte Magic Number | 硬编码魔法数字 |
+| dead code (suspected) | toter Code (vermutet) | 可能的死代码 |
+| workflow guide | Arbeitsablauf-Leitfaden | 工作流指南 |
+| data flow | Datenfluss | 数据流 |
+| executive summary | Zusammenfassung | 执行摘要 |
+| complexity score | Komplexitätswert | 复杂度评分 |
+| named range | benannter Bereich | 命名区域 |
+| hidden / very-hidden sheet | ausgeblendetes / streng-ausgeblendetes Blatt | 隐藏 / 深度隐藏工作表 |
+| static analysis | statische Analyse | 静态分析 |
+| local-only / no network | nur lokal / keine Netzwerkverbindung | 仅本地 / 无网络调用 |
+"""
+
 _PROMPT_RULES = """\
 ## Rules for every narrative
 
@@ -635,6 +670,61 @@ MRP netting downstream."
 """
 
 
+_PROMPT_OUTPUT_FORMAT_TRILINGUAL = """\
+## Output Format (STRICT, TRILINGUAL)
+
+Return **one** JSON object. Keys are the marker IDs listed in the "Questions"
+section. **Each value is itself a three-key object** with `en`, `de`, and
+`zh` fields — one narrative per language.
+
+Example shape (illustrative — your real keys come from the Questions list):
+
+```json
+{
+  "vba-narration:Module_MRP": {
+    "en": "Implements classic MRP netting: nets gross requirements (from MPS) \
+against on-hand inventory plus open supplier orders, producing planned order \
+releases by part. Hardcodes a 0.05 loss factor that should arguably live \
+in _constants.",
+    "de": "Implementiert klassisches MRP-Nettorechnen: verrechnet \
+Bruttobedarfe (aus dem Hauptproduktionsplan) mit Lagerbestand plus offenen \
+Lieferantenbestellungen und erzeugt geplante Bestellfreigaben pro Teil. \
+Enthält einen hartkodierten Verlustfaktor 0.05, der eher in _constants \
+gehören sollte.",
+    "zh": "实现经典 MRP 净需求计算:用主生产计划的总需求扣减库存与未达供应商订单,\
+按零件输出计划下单量。硬编码了 0.05 的损耗因子,更合适放在 _constants 中。"
+  },
+  "data-flow:BOM": {
+    "en": "Bill of Materials lookup table. Static input — the parent/child \
+component relationships are user-maintained and consumed by MRP netting \
+downstream.",
+    "de": "Stückliste (BOM) — Nachschlagetabelle. Statische Eingabe; die \
+Eltern-Kind-Komponentenbeziehungen werden manuell gepflegt und nachgelagert \
+vom MRP-Nettorechnen verwendet.",
+    "zh": "物料清单查表。静态输入 — 父子组件关系由用户维护,下游被 MRP 净需求\
+计算使用。"
+  }
+}
+```
+
+**Rules for the trilingual JSON object**:
+- One top-level object. No outer array, no metadata wrapper.
+- Keys are STRINGS exactly matching marker IDs in the Questions section.
+- Values are OBJECTS with the three keys `en`, `de`, `zh`. All three fields
+  required for every marker you fill.
+- Each language field must contain 2-4 sentences with **the same factual
+  content**; only the language should differ. Do NOT add facts to one language
+  that the others don't have.
+- Use the canonical glossary translations below — German favours SAP /
+  manufacturing convention, Chinese favours mainland convention.
+- Strings must be valid JSON (escape internal double-quotes and backslashes).
+- Do NOT wrap the JSON in a markdown code fence. Plain JSON, top to bottom.
+- If you cannot confidently produce all three languages for a marker, **omit
+  that marker entirely** rather than mixing or hallucinating a translation.
+  The ingest step keeps the heuristic narrative when an ID is missing.
+"""
+
+
 def _format_workbook_summary(meta: dict) -> str:
     """Compact 6-line summary for the prompt header."""
     parts = [
@@ -674,7 +764,7 @@ def _format_questions(markers_to_fill: list) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(dossier: dict) -> str:
+def build_prompt(dossier: dict, lang: str = "en") -> str:
     """Build the mega-prompt to give the LLM.
 
     The prompt embeds:
@@ -684,6 +774,12 @@ def build_prompt(dossier: dict) -> str:
         - Output format (strict JSON, marker IDs as keys)
         - Questions: one entry per marker with context + ask
 
+    `lang` selects the output schema:
+        - "en"      — flat JSON (one narrative per marker)
+        - "de"|"zh" — flat JSON, narratives in target language
+        - "all"     — trilingual nested JSON ({en, de, zh} per marker)
+                      with the glossary embedded.
+
     The dossier.json is referenced as an attachment — we tell the LLM
     "see dossier.json for full VBA source + sheet samples" so the prompt
     stays readable.
@@ -692,6 +788,45 @@ def build_prompt(dossier: dict) -> str:
     questions = _format_questions(dossier["markers_to_fill"])
     n_markers = len(dossier["markers_to_fill"])
 
+    is_trilingual = (lang == "all")
+    if is_trilingual:
+        output_format = _PROMPT_OUTPUT_FORMAT_TRILINGUAL
+        glossary_block = "\n" + _PROMPT_GLOSSARY + "\n"
+        closing = (
+            "Remember: respond with ONE JSON object, no markdown fence, "
+            "no preamble. Keys = marker IDs above; values = three-key objects "
+            "with `en`, `de`, `zh` narratives (2-4 sentences each, same facts, "
+            "only the language differs). Skip any ID you can't confidently "
+            "answer in all three languages.\n"
+        )
+    elif lang in ("de", "zh"):
+        # Single-lang non-English: reuse flat shape but instruct narratives
+        # to be in target language using glossary.
+        lang_word = {"de": "German (SAP/manufacturing convention)",
+                     "zh": "Chinese (mainland convention)"}[lang]
+        output_format = (
+            _PROMPT_OUTPUT_FORMAT
+            + f"\n**Language**: produce all narratives in **{lang_word}**, "
+            f"using the canonical glossary below verbatim. Keep technical "
+            f"identifiers (sheet names, cell refs, VBA module names) "
+            f"unchanged in any language.\n"
+        )
+        glossary_block = "\n" + _PROMPT_GLOSSARY + "\n"
+        closing = (
+            f"Remember: respond with ONE JSON object, no markdown fence, no "
+            f"preamble. Keys = marker IDs above; values = your 2-4 sentence "
+            f"narratives in {lang_word}. Skip any ID you can't confidently "
+            f"answer.\n"
+        )
+    else:
+        output_format = _PROMPT_OUTPUT_FORMAT
+        glossary_block = ""
+        closing = (
+            "Remember: respond with ONE JSON object, no markdown fence, no "
+            "preamble. Keys = marker IDs above; values = your 2-4 sentence "
+            "narratives. Skip any ID you can't confidently answer.\n"
+        )
+
     body = (
         _PROMPT_HEADER
         + "\n## Workbook context\n\n"
@@ -699,8 +834,8 @@ def build_prompt(dossier: dict) -> str:
         + "\n\n"
         + _PROMPT_RULES
         + "\n"
-        + _PROMPT_OUTPUT_FORMAT
-        + "\n"
+        + output_format
+        + glossary_block
         + (
             f"## Reference data\n\n"
             f"The companion file **`dossier.json`** (attached alongside this "
@@ -720,9 +855,7 @@ def build_prompt(dossier: dict) -> str:
         + f"## Questions ({n_markers} markers)\n\n"
         + questions
         + "\n---\n\n"
-        + "Remember: respond with ONE JSON object, no markdown fence, no "
-        + "preamble. Keys = marker IDs above; values = your 2-4 sentence "
-        + "narratives. Skip any ID you can't confidently answer.\n"
+        + closing
     )
     return body
 
@@ -731,7 +864,8 @@ def build_prompt(dossier: dict) -> str:
 # Public entry point
 # =============================================================================
 
-def extract(report, audit_md_text: str, out_dir: Path, source_path=None) -> dict:
+def extract(report, audit_md_text: str, out_dir: Path,
+            source_path=None, lang: str = "en") -> dict:
     """Extract phase — write dossier.json + prompt.md into out_dir.
 
     Returns paths dict for the CLI to print/log.
@@ -739,14 +873,19 @@ def extract(report, audit_md_text: str, out_dir: Path, source_path=None) -> dict
     `audit_md_text` is the rendered audit.md content (so we can pull marker
     IDs the renderer actually emitted). `out_dir` must exist. `source_path`
     is the original xlsm path; passing it enables sample-formula extraction
-    per sheet.
+    per sheet. `lang` selects the prompt schema (`en`|`de`|`zh`|`all`); when
+    `all`, the prompt requests the trilingual nested JSON shape.
     """
     out_dir = Path(out_dir)
     if not out_dir.exists():
         raise RuntimeError(f"out_dir does not exist: {out_dir}")
 
     dossier = build_dossier(report, audit_md_text, source_path=source_path)
-    prompt = build_prompt(dossier)
+    # Echo the requested language into the dossier so ingest can sanity-check
+    # whether the responses.json shape it received matches what the prompt
+    # asked for.
+    dossier["prompt_lang"] = lang
+    prompt = build_prompt(dossier, lang=lang)
 
     dossier_path = out_dir / "dossier.json"
     prompt_path = out_dir / "prompt.md"
@@ -762,4 +901,5 @@ def extract(report, audit_md_text: str, out_dir: Path, source_path=None) -> dict
         "dossier_path": str(dossier_path),
         "prompt_path": str(prompt_path),
         "marker_count": len(dossier["markers_to_fill"]),
+        "lang": lang,
     }

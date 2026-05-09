@@ -61,7 +61,7 @@ Route master table — one row per delivery route (RouteID, AssignedVehicle, Dis
 
 <!-- LLM-AUGMENT: data-flow:Customers -->
 ### `Customers` (visible, 41 rows × 4 cols, 164 non-empty cells)
-Customer master with delivery time windows (CustomerID, City, TimeWindowStart, TimeWindowEnd). Pure static input — no formulas, no consumers in this workbook's static graph. Surprising in a routing context: real VRPTW (Vehicle Routing with Time Windows) systems would join Customers to Shipments to enforce window feasibility; the absence of any formula reading this sheet suggests the time-window logic has not been wired up yet, or is enforced manually outside the workbook.
+**Role**: **input sheet** — no formulas, no inbound cross-sheet references, no VBA writes. Likely user-driven manual entry.
 
 <!-- LLM-AUGMENT: data-flow:订单 -->
 ### `订单` (visible, 21 rows × 6 cols, 126 non-empty cells)
@@ -69,11 +69,31 @@ Order header table (Chinese-localized: 订单 = orders). Static input, 0 formula
 
 <!-- LLM-AUGMENT: data-flow:Vehicles -->
 ### `Vehicles` (visible, 16 rows × 4 cols, 64 non-empty cells)
-Fleet master — VehicleID, CapacityKg, MaxStops, FuelCostPerKm. The FuelCostPerKm column (D) is a derived value `FUEL_PRICE * <vehicle-specific factor>`, meaning fuel-price changes propagate everywhere automatically. Read by Routes (30 cross-sheet references) for capacity-utilization VLOOKUPs. This sheet is hybrid: capacity/stops are static input, fuel cost is computed.
+**Role**: **computed sheet** — populated by formulas with cross-sheet lookups.
+**Consumers** (other sheets reading this one): `Routes` (30).
 
 <!-- LLM-AUGMENT: data-flow:_constants -->
 ### `_constants` (veryHidden, 7 rows × 5 cols, 35 non-empty cells)
-VeryHidden parameter sheet — six magic-number constants (MAX_VEHICLES=15, SPEED_KMH=60, SERVICE_TIME_MIN=15, MAX_STOPS_PER_ROUTE=20, FUEL_PRICE=1.85, DRIVER_SHIFT_HOURS=8). These are referenced via named ranges (FUEL_PRICE in Routes/Shipments/Vehicles formulas), making this the tunable-parameter store of the workbook. Hiding these via veryHidden is a refactoring trap — Excel UI's standard Hide/Unhide menu cannot reveal them; only VBA can.
+**Role**: **input sheet** — no formulas, no inbound cross-sheet references, no VBA writes. Likely user-driven manual entry.
+
+**Sheet data flow diagram**:
+
+_Cross-sheet formula references. Edge label = number of formulas with cross-sheet refs from source -> target sheet. Yellow = hidden, red = veryHidden._
+
+```mermaid
+graph LR
+Customers["Customers"]
+Routes["Routes"]
+Shipments["Shipments"]
+Vehicles["Vehicles"]
+S_constants["_constants"]
+S__["订单"]
+Shipments -->|100| Routes
+Routes -->|30| Shipments
+Routes -->|30| Vehicles
+classDef veryHidden fill:#ef9a9a,stroke:#b71c1c,color:#000000;
+class S_constants veryHidden
+```
 
 ## Top Impact Findings
 
@@ -124,7 +144,13 @@ HTTP client implementation inherited verbatim from the public VBA-Web library (v
 
 <!-- LLM-AUGMENT: vba-narration:backup__000WebHelpers.bas -->
 ### `backup__000WebHelpers.bas` (data-loader, 3177 lines)
-Utility module from VBA-Web: JSON/XML parsing, URL encoding, datetime formatting, base64. 3177 lines of standalone helpers, no business logic specific to logistics or routing. **External COM calls present** (CreateObject, Shell, Application.Run) — typical malware-analysis red flags but in this case explained by the donor's HTTP-client purpose. Treat as inherited dead code unless any logistics module is found to actually call into it.
+
+**Role inference**: large multi-purpose module — likely the workbook's main logic block.
+**What it does (structural)**: calls into modules `Dictionary.cls`, `backup__001WebClient.cls`, `backup__002WebRequest.cls`; contains 2 levels of nested loops.
+**Notable patterns**:
+- Contains `On Error Resume Next` at line(s) 2129, 2317 — silent failure risk; errors are suppressed silently.
+- Uses external/COM API keyword(s): `Application.Run`, `CreateObject`, `Shell`.
+**Call relationships**: called by `DigestAuthenticator.cls`, `FacebookAuthenticator.cls`, `GoogleAuthenticator.cls` (+12 more); calls `Dictionary.cls`, `backup__001WebClient.cls`, `backup__002WebRequest.cls`.
 
 <!-- LLM-AUGMENT: vba-narration:backup__002WebRequest.cls -->
 ### `backup__002WebRequest.cls` (mixed, 874 lines)
@@ -135,10 +161,20 @@ Utility module from VBA-Web: JSON/XML parsing, URL encoding, datetime formatting
 
 <!-- LLM-AUGMENT: vba-narration:Dictionary.cls -->
 ### `Dictionary.cls` (mixed, 458 lines)
-Pure-VBA hash-map implementation, originally written by Tim Hall for VBA-Web to provide ordered key/value pairs in a runtime that lacks them natively. No business logic, no sheet I/O. Useful only as a data-structure utility — its presence confirms the workbook inherited VBA-Web infrastructure but says nothing about the workbook's actual purpose.
+
+**Role inference**: mixed responsibilities — no single structural signal dominates.
+**What it does (structural)**: calls into modules `backup__001WebClient.cls`.
+**Notable patterns**:
+- Contains `On Error Resume Next` at line(s) 259 — silent failure risk; errors are suppressed silently.
+- Uses external/COM API keyword(s): `CreateObject`, `GetObject`.
+**Call relationships**: called by `Credentials.bas`, `Salesforce.bas`, `TodoistAuthenticator.cls` (+4 more); calls `backup__001WebClient.cls`.
+
+### Possibly dead code (36 module(s))
+
+_The following modules are not reached from any detected button or event handler. They may be legacy code, helper libraries pulled in but unused, or detection misses (ActiveX controls, dynamic VBA calls). Audit before deleting._
 
 <!-- LLM-AUGMENT: vba-narration:Analytics.bas -->
-Google Analytics REST API wrapper from VBA-Web's example collection. Authenticates via OAuth2 and pulls analytics data into Excel. **Has no relation to logistics or routing** — this is donor sample code. Should be deleted in any refactor; it pads VBA module count without contributing business logic.
+- `Analytics.bas` (mixed, 62 lines, 1 subs/funcs)
 <!-- LLM-AUGMENT: vba-narration:AnalyticsSheet.cls -->
 - `AnalyticsSheet.cls` (report-writer, 31 lines, 2 subs/funcs)
 <!-- LLM-AUGMENT: vba-narration:backup__003WebResponse.cls -->
@@ -152,7 +188,8 @@ Google Analytics REST API wrapper from VBA-Web's example collection. Authenticat
 <!-- LLM-AUGMENT: vba-narration:EmptyAuthenticator.cls -->
 - `EmptyAuthenticator.cls` (dead-suspected, 75 lines, 5 subs/funcs)
 <!-- LLM-AUGMENT: vba-narration:Facebook.bas -->
-Facebook Graph API wrapper, also from VBA-Web examples. OAuth2-authenticated REST client. **Same provenance and same observation as Analytics.bas** — donor sample code that ships unused. Removing it requires no behavioral change to the workbook.
+- `Facebook.bas` (dead-suspected, 30 lines, 1 subs/funcs)
+- _(+28 more — see §8.7.)_
 
 ## Domain-Specific Findings
 
@@ -162,7 +199,7 @@ _**What this means**: domain templates pre-populate "things to look for" specifi
 
 <!-- LLM-AUGMENT: domain-method:logistics-routing -->
 ### Logistics — Vehicle Routing  _(confidence: high)_
-The workbook detects as logistics-routing via keyword hits (Routes/Vehicles/Shipments) but implements only the simplest decision support: per-route capacity utilization (SUMIFS / capacity) and per-shipment fuel cost. **No actual routing optimization is present** — there is no Clarke-Wright savings algorithm, no nearest-neighbor heuristic, no time-window feasibility check, no Solver invocation. The workbook is therefore a routing **report generator**, not a routing **planner**. If decisions are being made elsewhere (manual planner spreadsheet, third-party TMS), this workbook merely visualizes the result. If decisions are being made HERE, the planner is doing it by hand and the magic numbers in `_constants` are their assumption sheet.
+The workbook detects as logistics-routing via keyword hits (Routes/Vehicles/Shipments) but implements only the simplest decision support: per-route capacity utilization (SUMIFS / capacity) and per-shipment fuel cost. **No actual routing optimization is present** — there is no Clarke-Wright savings algorithm, no nearest-neighbor heuristic, no time-window feasibility check, no Solver invocation. The workbook is therefore a routing **report generator**, not a routing **planner**. If decisions are being made elsewhere (manual planner spreadsheet, third-party TMS), this workbook merely visualizes the result.
 
 ## Reference Appendix
 

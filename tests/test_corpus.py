@@ -563,3 +563,78 @@ def test_format_flag(tmp_path: Path):
     assert rc == 0
     assert (out_both / "audit.md").exists()
     assert (out_both / "audit.html").exists()
+
+
+# ----------------------------------------------------------------------------
+# 21. Stage 5: --lang flag — en/de/zh produce non-empty single-tree output
+# ----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("lang", ["en", "de", "zh"])
+def test_lang_single(tmp_path: Path, lang: str):
+    """Each single-language run produces a non-empty audit.md/json/html."""
+    p = CORPUS["capacity_planning_synth"]
+    if not p.exists():
+        pytest.skip("synth not found")
+    out = tmp_path / f"out_{lang}"
+    out.mkdir(parents=True, exist_ok=True)
+    rc = cli_main([str(p), "--out-dir", str(out), "--lang", lang])
+    assert rc == 0
+    md = (out / "audit.md").read_text(encoding="utf-8")
+    js = (out / "audit.json").read_text(encoding="utf-8")
+    html = (out / "audit.html").read_text(encoding="utf-8")
+    assert len(md) > 1000, f"audit.md for {lang} too short"
+    assert len(js) > 1000, f"audit.json for {lang} too short"
+    assert len(html) > 1000, f"audit.html for {lang} too short"
+    # Localised title appears
+    titles = {
+        "en": "# Audit report",
+        "de": "# Audit-Bericht",
+        "zh": "# 审计报告",
+    }
+    assert md.startswith(titles[lang])
+
+
+# ----------------------------------------------------------------------------
+# 22. Stage 5: --lang all — three sibling output dirs produced
+# ----------------------------------------------------------------------------
+
+def test_lang_all(tmp_path: Path):
+    p = CORPUS["capacity_planning_synth"]
+    if not p.exists():
+        pytest.skip("synth not found")
+    out = tmp_path / "out_all"
+    out.mkdir(parents=True, exist_ok=True)
+    rc = cli_main([str(p), "--out-dir", str(out), "--lang", "all"])
+    assert rc == 0
+    for lang in ("en", "de", "zh"):
+        sub = out / lang
+        assert sub.exists(), f"--lang all should create {sub}"
+        assert (sub / "audit.md").exists()
+        assert (sub / "audit.json").exists()
+        assert (sub / "audit.html").exists()
+
+
+# ----------------------------------------------------------------------------
+# 23. Stage 5: idempotency holds per-language
+# ----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("lang", ["en", "de", "zh"])
+def test_lang_idempotency(tmp_path: Path, lang: str):
+    p = CORPUS["capacity_planning_synth"]
+    if not p.exists():
+        pytest.skip("synth not found")
+    out1 = tmp_path / "run1"
+    out2 = tmp_path / "run2"
+    out1.mkdir(); out2.mkdir()
+    rc1 = cli_main([str(p), "--out-dir", str(out1), "--lang", lang])
+    rc2 = cli_main([str(p), "--out-dir", str(out2), "--lang", lang])
+    assert rc1 == 0 and rc2 == 0
+    md1 = (out1 / "audit.md").read_bytes()
+    md2 = (out2 / "audit.md").read_bytes()
+    assert md1 == md2, f"audit.md not idempotent for lang={lang}"
+    js1 = (out1 / "audit.json").read_bytes()
+    js2 = (out2 / "audit.json").read_bytes()
+    assert js1 == js2, f"audit.json not idempotent for lang={lang}"
+    html1 = (out1 / "audit.html").read_bytes()
+    html2 = (out2 / "audit.html").read_bytes()
+    assert html1 == html2, f"audit.html not idempotent for lang={lang}"

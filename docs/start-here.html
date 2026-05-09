@@ -356,9 +356,11 @@ open ./audit-output/audit-enriched.html</code></pre>
   We verified Track B end-to-end on the <code>logistics_routing_synth.xlsm</code>
   fixture (the synthetic logistics-routing workbook in this repo's tests).
   The actual enriched outputs are committed at
-  <code>docs/example-enriched-audit.{md,html}</code>
-  (<a href="example-enriched-audit.html">open the HTML directly</a>) and
-  the LLM responses that produced them are at
+  <code>docs/example-enriched-audit.{en,de,zh}.{md,html}</code>
+  (<a href="example-enriched-audit.en.html">open the English HTML</a>,
+  <a href="example-enriched-audit.de.html">German</a>, or
+  <a href="example-enriched-audit.zh.html">Chinese</a>) and
+  the trilingual LLM responses that produced them are at
   <code>docs/example-llm-responses.json</code>.
 </p>
 <p>
@@ -399,6 +401,34 @@ open ./audit-output/audit-enriched.html</code></pre>
   <code>replaced     : 13 marker(s)</code> +
   <code>kept (heur.) : 7 marker(s) with no LLM response — heuristic narrative kept</code>.
   Partial fill is normal — the model is told to skip markers it can't ground in evidence.
+</p>
+
+<h3>5d. Trilingual reports (en / de / zh)</h3>
+<p>
+  English is the master; German and Chinese are derived translations using
+  SAP/manufacturing-industry-standard terminology (Stückliste / 物料清单 for
+  Bill of Materials, Hauptproduktionsplan / 主生产计划 for MPS, etc.). User
+  data — sheet names, cell values, formula text, VBA source — stays verbatim
+  in any language; only the surrounding narrative is translated. Pass
+  <code>--lang</code> to choose:
+</p>
+<pre><code># single-language run (default is en)
+audit-xlsm file.xlsm --out-dir ./audit-output --lang de
+
+# all three languages, three sibling output trees
+audit-xlsm file.xlsm --out-dir ./audit-output --lang all
+# &rarr; ./audit-output/{en,de,zh}/audit.{md,html,json}
+</code></pre>
+<p>
+  Track B works the same way: <code>--lang all --harness</code> generates one
+  <code>dossier.json</code> + <code>prompt.md</code> per language directory, and
+  the prompt instructs the LLM to return a trilingual nested JSON shape
+  (<code>{"id": {"en": "...", "de": "...", "zh": "..."}}</code>) with the
+  glossary embedded inline. The example trilingual responses we shipped on the
+  logistics-routing fixture are at
+  <code>docs/example-llm-responses.json</code> — they round-trip through
+  <code>--ingest --lang all</code> to the three
+  <code>example-enriched-audit.{en,de,zh}.html</code> files linked above.
 </p>
 
 <h2 id="trouble">6. Troubleshooting</h2>

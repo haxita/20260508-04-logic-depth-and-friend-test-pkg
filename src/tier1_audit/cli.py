@@ -33,11 +33,13 @@ from pathlib import Path
 from . import __version__
 from .audit import build_audit
 from .harness import extract as harness_extract
+from .i18n import SUPPORTED_LANGS
 from .ingest import ingest as harness_ingest
 from .render import render_html, render_json, render_markdown
 
 
 _MERMAID_CDN_URL = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
+_LANG_CHOICES = ("en", "de", "zh", "all")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -77,6 +79,12 @@ def _build_parser() -> argparse.ArgumentParser:
                          "produce audit-enriched.{md,html} alongside the "
                          "originals. Path is to a JSON file the user saved "
                          "after pasting the harness prompt into their LLM.")
+    ap.add_argument("--lang", choices=list(_LANG_CHOICES), default="en",
+                    help="Output language: en (default, master), de (German), "
+                         "zh (Chinese), or all (produce three sibling output "
+                         "directories <out>/en, <out>/de, <out>/zh). "
+                         "English is canonical; DE/ZH translations use "
+                         "SAP/manufacturing-industry-standard terminology.")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return ap
 
@@ -114,42 +122,32 @@ def main(argv=None) -> int:
     # Pure-ingest path: --ingest is set and audit.md already exists in out-dir.
     # Skip the (slow) audit rebuild — just substitute markers.
     if args.ingest:
-        existing_md = out / "audit.md"
-        if not existing_md.exists():
-            print(
-                f"FATAL: --ingest requires an existing audit.md in --out-dir.\n"
-                f"  Expected: {existing_md}\n"
-                f"  Run `audit-xlsm {src.name} --out-dir {out}` first (or with "
-                f"`--harness` to also generate the LLM prompt).",
-                file=sys.stderr,
-            )
-            return 1
-        existing_html = out / "audit.html"
-        out_md = out / "audit-enriched.md"
-        out_html = out / "audit-enriched.html" if existing_html.exists() else None
         try:
-            stats = harness_ingest(
-                audit_md_path=existing_md,
-                audit_html_path=existing_html if existing_html.exists() else None,
+            stats_summary = harness_ingest(
+                audit_dir=out,
                 responses_path=Path(args.ingest).expanduser().resolve(),
-                out_md_path=out_md,
-                out_html_path=out_html,
+                lang=args.lang,
             )
         except SystemExit as e:
             print(str(e), file=sys.stderr)
             return 1
+        except FileNotFoundError as e:
+            print(f"FATAL: {e}", file=sys.stderr)
+            return 1
         print(f"input        : {src.name}")
         print(f"out-dir      : {out}")
         print(f"responses    : {args.ingest}")
-        print(f"enriched md  : {stats['md_path']}")
-        if stats.get("html_path"):
-            print(f"enriched html: {stats['html_path']}")
-        print(f"replaced     : {len(stats['md_replaced'])} marker(s)")
-        print(f"kept (heur.) : {len(stats['md_kept_heuristic'])} marker(s) "
-              f"with no LLM response — heuristic narrative kept")
-        if stats["md_unused_responses"]:
-            print(f"unused keys  : {len(stats['md_unused_responses'])} response key(s) "
-                  f"didn't match any marker (ignored)")
+        print(f"lang         : {args.lang}")
+        for entry in stats_summary["entries"]:
+            print(f"enriched md  : {entry['md_path']} [{entry['lang']}]")
+            if entry.get("html_path"):
+                print(f"enriched html: {entry['html_path']} [{entry['lang']}]")
+            print(f"  replaced   : {len(entry['md_replaced'])} marker(s)")
+            print(f"  kept (h.)  : {len(entry['md_kept_heuristic'])} marker(s) "
+                  f"with no LLM response — heuristic narrative kept")
+            if entry["md_unused_responses"]:
+                print(f"  unused     : {len(entry['md_unused_responses'])} response key(s) "
+                      f"didn't match any marker (ignored)")
         return 0
 
     try:
@@ -164,62 +162,78 @@ def main(argv=None) -> int:
         print(f"FATAL: audit pipeline crashed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
-    # JSON is always written.
-    js = render_json(report)
-    (out / "audit.json").write_text(js, encoding="utf-8")
-
     want_md = args.format in ("md", "both")
     want_html = args.format in ("html", "both")
 
-    if want_md:
-        md = render_markdown(report)
-        (out / "audit.md").write_text(md, encoding="utf-8")
-
-    if want_html:
-        mermaid_inline_src = ""
-        if args.mermaid_inline:
-            try:
-                mermaid_inline_src = _fetch_mermaid_js()
-            except RuntimeError as e:
-                print(f"WARN: --mermaid-inline failed; falling back to CDN: {e}",
-                      file=sys.stderr)
-                args.mermaid_inline = False
-        html = render_html(
-            report,
-            mermaid_inline=args.mermaid_inline,
-            mermaid_inline_source=mermaid_inline_src,
-        )
-        (out / "audit.html").write_text(html, encoding="utf-8")
-
-    # Track B harness extract: emit dossier.json + prompt.md alongside
-    # the standard audit.* outputs. We re-load audit.md from disk here
-    # rather than re-rendering, so the marker IDs in the dossier always
-    # match what the user actually sees in audit.md.
-    if args.harness:
-        # We need audit.md to extract marker IDs. If --format=html only,
-        # re-render markdown in-memory (don't write it).
-        if want_md:
-            md_for_harness = (out / "audit.md").read_text(encoding="utf-8")
-        else:
-            md_for_harness = render_markdown(report)
-        try:
-            h_stats = harness_extract(
-                report=report,
-                audit_md_text=md_for_harness,
-                out_dir=out,
-                source_path=src,
-            )
-            harness_marker_count = h_stats["marker_count"]
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"WARN: --harness extract failed: {type(e).__name__}: {e}\n{tb}",
-                  file=sys.stderr)
-            harness_marker_count = None
+    # Resolve target languages
+    if args.lang == "all":
+        target_langs = list(SUPPORTED_LANGS)
     else:
-        harness_marker_count = None
+        target_langs = [args.lang]
+
+    # When --lang all, write to <out>/<lang>/audit.* — three sibling trees.
+    # When single lang, write to <out>/audit.* (current behavior).
+    def _resolve_lang_outdir(lang: str) -> Path:
+        if args.lang == "all":
+            d = out / lang
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        return out
+
+    mermaid_inline_src = ""
+    if want_html and args.mermaid_inline:
+        try:
+            mermaid_inline_src = _fetch_mermaid_js()
+        except RuntimeError as e:
+            print(f"WARN: --mermaid-inline failed; falling back to CDN: {e}",
+                  file=sys.stderr)
+            args.mermaid_inline = False
+
+    harness_marker_count = None
+    for lang in target_langs:
+        lang_dir = _resolve_lang_outdir(lang)
+        # JSON is always written.
+        js = render_json(report, lang=lang)
+        (lang_dir / "audit.json").write_text(js, encoding="utf-8")
+        if want_md:
+            md = render_markdown(report, lang=lang)
+            (lang_dir / "audit.md").write_text(md, encoding="utf-8")
+        if want_html:
+            html = render_html(
+                report,
+                mermaid_inline=args.mermaid_inline,
+                mermaid_inline_source=mermaid_inline_src,
+                lang=lang,
+            )
+            (lang_dir / "audit.html").write_text(html, encoding="utf-8")
+        # Track B harness extract: emit dossier.json + prompt.md alongside
+        # the standard audit.* outputs. When --lang all, the harness writes
+        # ONE dossier+prompt pair per language directory (so the LLM-generated
+        # narratives match the language's audit.md marker layout).
+        if args.harness:
+            if want_md:
+                md_for_harness = (lang_dir / "audit.md").read_text(encoding="utf-8")
+            else:
+                md_for_harness = render_markdown(report, lang=lang)
+            try:
+                h_stats = harness_extract(
+                    report=report,
+                    audit_md_text=md_for_harness,
+                    out_dir=lang_dir,
+                    source_path=src,
+                    lang=args.lang,  # tells the prompt builder whether to
+                                     # request trilingual JSON or single-lang
+                )
+                harness_marker_count = h_stats["marker_count"]
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"WARN: --harness extract failed: {type(e).__name__}: {e}\n{tb}",
+                      file=sys.stderr)
+                harness_marker_count = None
 
     print(f"input    : {src.name}")
     print(f"out-dir  : {out}")
+    print(f"lang     : {args.lang}")
     print(f"format   : {args.format}{' + mermaid-inline' if args.mermaid_inline and want_html else ''}")
     print(f"sanitize : {'on' if args.sanitize else 'off'}")
     print(f"complex. : {report.complexity.total}/100")
@@ -237,7 +251,7 @@ def main(argv=None) -> int:
     print(f"errors   : {report.basic_stats.parse_errors_count}")
     if args.harness and harness_marker_count is not None:
         print(f"harness  : dossier.json + prompt.md "
-              f"({harness_marker_count} marker(s) to fill)")
+              f"({harness_marker_count} marker(s) to fill, lang={args.lang})")
     return 0
 
 

@@ -428,3 +428,146 @@ def test_load_responses_skips_invalid_entries(tmp_path: Path, capsys):
     assert out == {"valid:1": "good narrative"}
     err = capsys.readouterr().err
     assert "skipped" in err
+
+
+# ----------------------------------------------------------------------------
+# 13. Stage 5: trilingual prompt generation includes glossary + nested schema
+# ----------------------------------------------------------------------------
+
+def test_trilingual_prompt_has_glossary_and_schema(tmp_path: Path):
+    """When --harness --lang all, the prompt.md must contain the glossary
+    table AND the trilingual JSON shape example."""
+    _require_synth()
+    out = tmp_path / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    rc = cli_main([
+        str(SYNTH_PATH), "--out-dir", str(out),
+        "--lang", "all", "--harness",
+    ])
+    assert rc == 0
+    # Each lang dir gets its own prompt.md
+    for lang in ("en", "de", "zh"):
+        prompt_path = out / lang / "prompt.md"
+        assert prompt_path.exists(), f"prompt.md missing for lang={lang}"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        # Trilingual instruction marker
+        assert "TRILINGUAL" in prompt or "three-key" in prompt
+        # Glossary present (German and Chinese terminology rows)
+        assert "Kapazitätsplanung" in prompt
+        assert "产能规划" in prompt
+        assert "systemrelevante Zelle" in prompt
+        # Example shape mentions {en, de, zh} structure
+        assert '"en":' in prompt
+        assert '"de":' in prompt
+        assert '"zh":' in prompt
+
+
+# ----------------------------------------------------------------------------
+# 14. Stage 5: ingest detects nested vs flat shape correctly
+# ----------------------------------------------------------------------------
+
+def test_ingest_detects_flat_shape(tmp_path: Path):
+    from tier1_audit.ingest import detect_responses_shape
+    flat = {"k1": "narrative", "k2": "another"}
+    assert detect_responses_shape(flat) == "flat"
+
+
+def test_ingest_detects_nested_shape(tmp_path: Path):
+    from tier1_audit.ingest import detect_responses_shape
+    nested = {"k1": {"en": "a", "de": "b", "zh": "c"}}
+    assert detect_responses_shape(nested) == "nested"
+
+
+def test_ingest_rejects_mixed_shape(tmp_path: Path):
+    from tier1_audit.ingest import detect_responses_shape
+    mixed = {"k1": "flat", "k2": {"en": "nested"}}
+    with pytest.raises(SystemExit):
+        detect_responses_shape(mixed)
+
+
+# ----------------------------------------------------------------------------
+# 15. Stage 5: trilingual ingest produces three enriched files
+# ----------------------------------------------------------------------------
+
+def test_trilingual_ingest_produces_three_enriched(tmp_path: Path):
+    """When responses.json has the nested {id: {en, de, zh}} shape and
+    --lang all is passed to ingest, three audit-enriched.{lang}.* files
+    should be written."""
+    _require_synth()
+    out = tmp_path / "out"
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: build the trilingual audit
+    rc = cli_main([
+        str(SYNTH_PATH), "--out-dir", str(out),
+        "--lang", "all", "--harness",
+    ])
+    assert rc == 0
+
+    # Step 2: discover marker IDs from one of the per-lang dossiers
+    dossier = json.loads((out / "en" / "dossier.json").read_text(encoding="utf-8"))
+    sample_ids = [m["id"] for m in dossier["markers_to_fill"][:3]]
+    fake_nested = {
+        mid: {
+            "en": f"EN narrative for {mid}",
+            "de": f"DE Erläuterung für {mid}",
+            "zh": f"{mid} 的中文叙述",
+        }
+        for mid in sample_ids
+    }
+    rp = out / "responses.json"
+    rp.write_text(json.dumps(fake_nested, ensure_ascii=False), encoding="utf-8")
+
+    # Step 3: run ingest with --lang all
+    rc2 = cli_main([
+        str(SYNTH_PATH), "--out-dir", str(out),
+        "--lang", "all", "--ingest", str(rp),
+    ])
+    assert rc2 == 0
+
+    # Step 4: three enriched files should now exist, each with the
+    # corresponding language's narrative.
+    for lang_short, expected_phrase in [
+        ("en", "EN narrative for"),
+        ("de", "DE Erläuterung für"),
+        ("zh", "的中文叙述"),
+    ]:
+        enr_md = out / lang_short / f"audit-enriched.{lang_short}.md"
+        enr_html = out / lang_short / f"audit-enriched.{lang_short}.html"
+        assert enr_md.exists(), f"enriched md for {lang_short} missing"
+        assert enr_html.exists(), f"enriched html for {lang_short} missing"
+        text = enr_md.read_text(encoding="utf-8")
+        assert expected_phrase in text, (
+            f"{lang_short} enriched file missing expected phrase: {expected_phrase!r}"
+        )
+
+
+# ----------------------------------------------------------------------------
+# 16. Stage 5: flat-shape responses fall back to legacy single-file output
+# ----------------------------------------------------------------------------
+
+def test_flat_responses_legacy_compat(tmp_path: Path):
+    """A responses.json in the legacy flat shape (id: string) must still
+    produce one audit-enriched.{md,html} (single-file legacy output) so
+    existing users aren't broken."""
+    _require_synth()
+    out = tmp_path / "out"
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Build a single-lang audit (English, default)
+    rc = cli_main([str(SYNTH_PATH), "--out-dir", str(out), "--harness"])
+    assert rc == 0
+    dossier = json.loads((out / "dossier.json").read_text(encoding="utf-8"))
+    real_id = dossier["markers_to_fill"][0]["id"]
+    flat = {real_id: "legacy-flat-narrative"}
+    rp = out / "responses.json"
+    rp.write_text(json.dumps(flat), encoding="utf-8")
+    # Run ingest WITHOUT --lang all
+    rc2 = cli_main([str(SYNTH_PATH), "--out-dir", str(out),
+                    "--ingest", str(rp)])
+    assert rc2 == 0
+    # Expect the LEGACY single-file naming
+    assert (out / "audit-enriched.md").exists()
+    assert (out / "audit-enriched.html").exists()
+    enriched = (out / "audit-enriched.md").read_text(encoding="utf-8")
+    assert "legacy-flat-narrative" in enriched

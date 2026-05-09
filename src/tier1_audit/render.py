@@ -24,10 +24,311 @@ from collections import defaultdict
 from dataclasses import asdict
 from typing import Any
 
+from .i18n import (
+    DEFAULT_LANG,
+    SUPPORTED_LANGS,
+    md_table_separator,
+    split_pipe_columns,
+    t,
+)
 from .smells import SMELL_TYPES, TRIVIAL_NUMBERS
 
 # Field names to omit from JSON serialization (huge or noisy or internal-only)
 _EXCLUDED_FIELDS = frozenset({"source_text", "_sheet_edges"})
+
+
+# ---------------------------------------------------------------------------
+# i18n helpers — re-derive narratives from structured fields per language
+# ---------------------------------------------------------------------------
+
+def _truncate_label_render(s: str, max_len: int = 30) -> str:
+    """Truncate a label/value to max_len, appending an ellipsis if cut.
+    Mirrors pillars._truncate_label so render-time re-derivation matches."""
+    if not s:
+        return s
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1].rstrip() + "…"
+
+
+def _pillar_inline_phrase(p, lang: str) -> str:
+    """Build the inline ' (value `X`, named range `Y`, label `Z`)' clause
+    using i18n labels. Returns '' when nothing useful is known (graceful).
+
+    Intentionally kept structurally identical to pillars._value_label_phrase
+    so the same Pillar object produces an equivalent inline phrase in any
+    language — only the prefix words ('value', 'named range', 'label') change.
+    """
+    parts: list = []
+    val = getattr(p, "value", "") or ""
+    nr = getattr(p, "named_range", "") or ""
+    rh = getattr(p, "row_header", "") or ""
+    ch = getattr(p, "col_header", "") or ""
+    if val:
+        # English keeps the verbatim "value" prefix from the master narrative;
+        # other langs translate just the prefix word.
+        if lang == DEFAULT_LANG:
+            parts.append(f"value `{_truncate_label_render(val, 30)}`")
+        else:
+            # Re-use the row/col label prefix style — but for value we need
+            # an explicit translation. For DE/ZH we hardcode to keep this
+            # function self-contained (the prefix words are stable enough
+            # to live in the narrative.pillar.* keys we already added).
+            value_word = {"de": "Wert", "zh": "值"}.get(lang, "value")
+            parts.append(f"{value_word} `{_truncate_label_render(val, 30)}`")
+    if nr:
+        prefix = t("pillar.label_named_range_prefix", lang)
+        parts.append(f"{prefix} `{nr}`")
+    label = rh or ch
+    if label and label != val:
+        prefix = t("pillar.label_row_prefix", lang)
+        parts.append(f"{prefix} `{_truncate_label_render(label, 30)}`")
+    if not parts:
+        return ""
+    return " (" + ", ".join(parts) + ")"
+
+
+def _pillar_kind_word(p, lang: str) -> str:
+    """Translate pillar_kind into the user-visible kind word."""
+    pk = getattr(p, "pillar_kind", "")
+    if pk == "column-block":
+        return t("narrative.pillar.kind_column_block", lang)
+    if pk == "formula-relay":
+        return t("narrative.pillar.kind_formula_relay", lang)
+    if pk == "constant-input":
+        return t("narrative.pillar.kind_value_anchor", lang)
+    return t("narrative.pillar.kind_default", lang)
+
+
+def _pillar_scope_phrase(p, lang: str) -> str:
+    """Render the 'sheet/sheets …' scope clause."""
+    sheets = list(p.affected_sheets or [])
+    n = len(sheets)
+    if n == 1:
+        return t("narrative.pillar.scope_one", lang, sheet=sheets[0])
+    if n <= 3:
+        joined = ", ".join(f"`{s}`" for s in sheets)
+        return t("narrative.pillar.scope_few", lang, sheets=joined)
+    listed = ", ".join(f"`{s}`" for s in sheets[:3])
+    return t("narrative.pillar.scope_many", lang, n_sheets=n, listed=listed)
+
+
+def _pillar_risk_phrase(fan_in: int, lang: str) -> str:
+    if fan_in >= 100:
+        return t("narrative.pillar.risk_high", lang)
+    if fan_in >= 50:
+        return t("narrative.pillar.risk_med", lang)
+    return t("narrative.pillar.risk_low", lang)
+
+
+def _render_pillar_narrative(p, lang: str) -> str:
+    """Re-derive the pillar narrative for `lang`.
+
+    For English we return the master narrative stored on the Pillar (so the
+    JSON output is byte-identical with pre-i18n behavior on EN). For DE / ZH
+    we rebuild from structured fields using i18n templates.
+    """
+    if lang == DEFAULT_LANG:
+        return getattr(p, "narrative", "") or ""
+    inline = _pillar_inline_phrase(p, lang)
+    scope = _pillar_scope_phrase(p, lang)
+    risk = _pillar_risk_phrase(p.fan_in, lang)
+    kind_word = _pillar_kind_word(p, lang)
+    if p.member_count > 1:
+        return t(
+            "narrative.pillar.group", lang,
+            member_count=p.member_count,
+            inline=inline,
+            fan_in=p.fan_in,
+            scope=scope,
+            risk=risk,
+        )
+    return t(
+        "narrative.pillar.single", lang,
+        location=p.location,
+        inline=inline,
+        kind_word=kind_word,
+        fan_in=p.fan_in,
+        scope=scope,
+        risk=risk,
+    )
+
+
+def _render_anomaly_narrative(a, lang: str) -> str:
+    """Re-derive the anomaly narrative for `lang`."""
+    if lang == DEFAULT_LANG:
+        return getattr(a, "narrative", "") or ""
+    locs = list(getattr(a, "outlier_locations", []) or [])
+    if len(locs) == 1:
+        cell_phrase = t("narrative.anomaly.cell_phrase_one", lang,
+                        location=locs[0])
+    else:
+        first = locs[0] if locs else ""
+        cell_phrase = t("narrative.anomaly.cell_phrase_many", lang,
+                        n=a.outlier_count, first=first)
+    mode_share = int(round(a.mode_count / max(a.cluster_size, 1) * 100))
+    # deviation: same approximation as anomalies._make_narrative — use
+    # numeric difference between mode and outlier when both numeric.
+    try:
+        dev = abs(float(a.outlier_value) - float(a.mode_value))
+        dev_str = f"{dev:g}"
+    except (TypeError, ValueError):
+        dev_str = "n/a"
+    return t(
+        "narrative.anomaly.text", lang,
+        cluster_size=a.cluster_size,
+        sample_formula=a.cluster_pattern_sample,
+        position=a.position_index + 1,
+        mode_display=a.mode_value,
+        mode_count=a.mode_count,
+        mode_share=mode_share,
+        cell_phrase=cell_phrase,
+        outlier_display=a.outlier_value,
+        dev=dev_str,
+    )
+
+
+def _render_vba_role_inference(role_key: str, lang: str) -> str:
+    """Translate the VbaNarrative.role_inference free-text back via key.
+
+    The narrate module emits role_inference as English prose. We pattern-match
+    on the canonical English text to find the i18n key. If no match, we keep
+    the raw English (better than `[[missing:…]]` for unexpected roles)."""
+    if lang == DEFAULT_LANG:
+        return role_key
+    role_key_norm = role_key.strip()
+    role_lookup = {
+        "isolated module — not reached from any button or event handler (possibly dead)":
+            "narrative.vba.role_isolated",
+        "leaf helper — invoked by other modules but invokes nothing further":
+            "narrative.vba.role_leaf_helper",
+        "system entry point — invokes other modules and is not invoked back":
+            "narrative.vba.role_entry_point",
+        "large multi-purpose module — likely the workbook's main logic block":
+            "narrative.vba.role_large",
+        "data ingest — reads external sources or workbook ranges into VBA structures":
+            "narrative.vba.role_data_loader",
+        "compute step — reads inputs, derives outputs, writes back to sheets":
+            "narrative.vba.role_transformer",
+        "output writer — populates sheet ranges with computed values":
+            "narrative.vba.role_report_writer",
+        "UI event handler — fires when the user opens the workbook or interacts with a sheet":
+            "narrative.vba.role_ui_handler",
+        "near-empty shell — typical for default class/sheet stubs with no real code":
+            "narrative.vba.role_dead_shell",
+        "mixed responsibilities — no single structural signal dominates":
+            "narrative.vba.role_mixed",
+    }
+    key = role_lookup.get(role_key_norm)
+    if key is None:
+        return role_key
+    return t(key, lang)
+
+
+def _render_vba_narrative(narr, lang: str) -> str:
+    """Re-derive the VBA narrative paragraph from VbaNarrative fields.
+
+    For English: we keep the existing pre-built narr.narrative for byte-
+    identical output. For DE/ZH: rebuild via i18n templates so structurally
+    equivalent prose appears in the target language.
+    """
+    if lang == DEFAULT_LANG:
+        return getattr(narr, "narrative", "") or ""
+    lines: list = []
+    role_translated = _render_vba_role_inference(narr.role_inference, lang)
+    lines.append(t("narrative.vba.role_inference", lang, role=role_translated))
+
+    parts: list = []
+    if narr.reads_sheets:
+        sheets = ", ".join(f"`{s}`" for s in narr.reads_sheets[:5])
+        more = (t("common.more_suffix", lang, n=len(narr.reads_sheets) - 5)
+                if len(narr.reads_sheets) > 5 else "")
+        parts.append(t("narrative.vba.reads", lang, sheets=sheets, more=more))
+    if narr.writes_sheets:
+        sheets = ", ".join(f"`{s}`" for s in narr.writes_sheets[:5])
+        more = (t("common.more_suffix", lang, n=len(narr.writes_sheets) - 5)
+                if len(narr.writes_sheets) > 5 else "")
+        parts.append(t("narrative.vba.writes", lang, sheets=sheets, more=more))
+    if narr.callees:
+        c = ", ".join(f"`{x}`" for x in narr.callees[:3])
+        more = (t("common.more_suffix", lang, n=len(narr.callees) - 3)
+                if len(narr.callees) > 3 else "")
+        parts.append(t("narrative.vba.calls_into", lang, callees=c, more=more))
+    if narr.callers and not narr.callees:
+        c = ", ".join(f"`{x}`" for x in narr.callers[:3])
+        parts.append(t("narrative.vba.invoked_by", lang, callers=c))
+    if narr.nested_loops_max >= 2:
+        parts.append(t("narrative.vba.nested_loops", lang,
+                       n=narr.nested_loops_max))
+    if not parts:
+        parts.append(t("narrative.vba.no_io", lang))
+    lines.append(t("narrative.vba.what_does", lang, parts="; ".join(parts)))
+
+    # Notable patterns
+    if narr.notable_patterns:
+        lines.append(t("narrative.vba.notable_patterns", lang))
+        for bp in narr.notable_patterns:
+            lines.append(f"- {_translate_notable_pattern(bp, narr, lang)}")
+
+    # Call relationships
+    rel_parts: list = []
+    if narr.callers:
+        c = ", ".join(f"`{x}`" for x in narr.callers[:3])
+        more = (t("common.more_suffix", lang, n=len(narr.callers) - 3)
+                if len(narr.callers) > 3 else "")
+        rel_parts.append(t("narrative.vba.called_by", lang, callers=c, more=more))
+    else:
+        rel_parts.append(t("narrative.vba.no_callers", lang))
+    if narr.callees:
+        c = ", ".join(f"`{x}`" for x in narr.callees[:3])
+        more = (t("common.more_suffix", lang, n=len(narr.callees) - 3)
+                if len(narr.callees) > 3 else "")
+        rel_parts.append(t("narrative.vba.calls_out", lang, callees=c, more=more))
+    else:
+        rel_parts.append(t("narrative.vba.no_callees", lang))
+    lines.append(t("narrative.vba.relations", lang, parts="; ".join(rel_parts)))
+
+    return "\n".join(lines)
+
+
+_RE_OER_LINES = re.compile(
+    r"Contains `On Error Resume Next` at line\(s\) ([0-9, ]+)"
+)
+_RE_NESTED_LOOPS = re.compile(
+    r"Contains (\d+) levels of nested loops"
+)
+_RE_EXTERNAL_KW = re.compile(
+    r"Uses external/COM API keyword\(s\): (.+?)$"
+)
+
+
+def _translate_notable_pattern(bullet: str, narr, lang: str) -> str:
+    """Translate the small set of notable-pattern bullets emitted by
+    vba_narrate._build_notable_patterns. Pattern-match the English shape and
+    rebuild via i18n. Falls back to the raw English bullet if no match."""
+    if lang == DEFAULT_LANG:
+        return bullet
+    m = _RE_OER_LINES.search(bullet)
+    if m:
+        return t("narrative.vba.oer_with_lines", lang, lines=m.group(1).strip())
+    if "Contains `On Error Resume Next` —" in bullet:
+        return t("narrative.vba.oer_no_lines", lang)
+    m = _RE_NESTED_LOOPS.search(bullet)
+    if m:
+        return t("narrative.vba.nested_loops_pattern", lang, n=m.group(1))
+    if bullet.startswith("Uses external/COM API keyword"):
+        # Pull keywords out
+        # Form: "Uses external/COM API keyword(s): `foo`, `bar` (+N more)."
+        rest = bullet[len("Uses external/COM API keyword(s):"):].strip().rstrip(".")
+        # Try to split (+N more) tail
+        more_match = re.search(r"\(\+(\d+) more\)\s*$", rest)
+        more = ""
+        if more_match:
+            more = t("common.more_suffix", lang, n=more_match.group(1))
+            rest = rest[: more_match.start()].rstrip()
+        return t("narrative.vba.external_keywords", lang,
+                 keywords=rest, more=more)
+    return bullet
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +355,60 @@ def _to_jsonable(obj: Any) -> Any:
     return obj
 
 
-def render_json(report) -> str:
+def render_json(report, lang: str = DEFAULT_LANG) -> str:
+    """Render the audit report as JSON.
+
+    For English (default), the output is byte-identical to the pre-i18n
+    behaviour. For DE / ZH, narrative text fields (pillar.narrative,
+    anomaly.narrative, vba_narrative.narrative, vba_narrative.role_inference,
+    vba_narrative.notable_patterns) are re-derived in the target language;
+    all structural fields stay verbatim.
+    """
     data = _to_jsonable(report)
+    if lang != DEFAULT_LANG:
+        data = _translate_jsonable(data, report, lang)
     return json.dumps(data, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+def _translate_jsonable(data: dict, report, lang: str) -> dict:
+    """Walk the JSON-able dict and translate the small set of narrative
+    fields that contain prose. All other fields stay verbatim — sheet names,
+    cell values, formula text, and numeric counts are user data.
+
+    Implementation note: we walk by key paths the audit pipeline uses, which
+    is small and stable. We do NOT attempt a generic "translate every string
+    field" walk — that would risk mangling user data.
+    """
+    # Pillars: re-derive p.narrative from structured fields
+    pillars_in = data.get("pillars") or []
+    if pillars_in and report.pillars:
+        for i, p_dict in enumerate(pillars_in):
+            if i < len(report.pillars):
+                p_dict["narrative"] = _render_pillar_narrative(report.pillars[i], lang)
+
+    # Anomalies
+    anomalies_in = data.get("anomalies") or []
+    if anomalies_in and report.anomalies:
+        for i, a_dict in enumerate(anomalies_in):
+            if i < len(report.anomalies):
+                a_dict["narrative"] = _render_anomaly_narrative(report.anomalies[i], lang)
+
+    # VBA narratives
+    narratives_in = data.get("vba_narratives") or []
+    if narratives_in and report.vba_narratives:
+        for i, n_dict in enumerate(narratives_in):
+            if i < len(report.vba_narratives):
+                narr = report.vba_narratives[i]
+                n_dict["narrative"] = _render_vba_narrative(narr, lang)
+                n_dict["role_inference"] = _render_vba_role_inference(
+                    narr.role_inference, lang
+                )
+                # notable_patterns: translate each bullet
+                n_dict["notable_patterns"] = [
+                    _translate_notable_pattern(bp, narr, lang)
+                    for bp in (narr.notable_patterns or [])
+                ]
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +472,7 @@ def _sub_score_bar(value: int, width: int = 10) -> str:
 # Headline-finding extraction (used by both md and html exec summary)
 # ---------------------------------------------------------------------------
 
-def _headline_findings(report) -> list:
+def _headline_findings(report, lang: str = DEFAULT_LANG) -> list:
     """Return up to 3 single-line headline findings: Top pillar, top anomaly
     or top smell, plus one risk indicator. Strings only — no markup beyond
     inline backticks."""
@@ -128,45 +480,52 @@ def _headline_findings(report) -> list:
     if report.pillars:
         p = report.pillars[0]
         if p.member_count > 1:
-            out.append(
-                f"**Pillar group**: `{p.location}` ({p.member_count} cells) "
-                f"each cascade into {p.fan_in} formulas."
-            )
+            out.append(t("exec_summary.headline_pillar_group", lang,
+                         location=p.location,
+                         member_count=p.member_count,
+                         fan_in=p.fan_in))
         else:
-            out.append(
-                f"**Pillar**: `{p.location}` cascades into {p.fan_in} formulas across "
-                f"{p.affected_sheet_count} sheet(s)."
-            )
+            out.append(t("exec_summary.headline_pillar_single", lang,
+                         location=p.location,
+                         fan_in=p.fan_in,
+                         affected_sheet_count=p.affected_sheet_count))
 
     if report.anomalies:
         a = report.anomalies[0]
-        out.append(
-            f"**Anomaly**: position #{a.position_index + 1} of a {a.cluster_size}-cell cluster "
-            f"normally `{a.mode_value}` but `{a.outlier_value}` at "
-            f"`{a.outlier_locations[0]}` ({a.confidence} conf)."
-        )
+        out.append(t("exec_summary.headline_anomaly", lang,
+                     position=a.position_index + 1,
+                     cluster_size=a.cluster_size,
+                     mode_value=a.mode_value,
+                     outlier_value=a.outlier_value,
+                     outlier_location=a.outlier_locations[0],
+                     confidence=a.confidence))
     elif report.smells:
-        # Top smell by metric
         top_smell = max(report.smells, key=lambda s: s.metric)
-        out.append(
-            f"**Top smell**: `{top_smell.smell_type}` at `{top_smell.location}` "
-            f"(metric={top_smell.metric:g}, severity={top_smell.severity})."
-        )
+        out.append(t("exec_summary.top_smell", lang,
+                     smell_type=top_smell.smell_type,
+                     location=top_smell.location,
+                     metric=f"{top_smell.metric:g}",
+                     severity=top_smell.severity))
 
     r = report.risk_indicators
     risks = []
     if r.very_hidden_sheets:
-        risks.append(f"{len(r.very_hidden_sheets)} veryHidden sheet(s)")
+        risks.append(t("exec_summary.headline_risk_very_hidden", lang,
+                       n=len(r.very_hidden_sheets)))
     if r.hidden_sheets:
-        risks.append(f"{len(r.hidden_sheets)} hidden sheet(s)")
+        risks.append(t("exec_summary.headline_risk_hidden", lang,
+                       n=len(r.hidden_sheets)))
     if r.cells_with_errors:
-        risks.append(f"{len(r.cells_with_errors)} formula error cell(s)")
+        risks.append(t("exec_summary.headline_risk_errors", lang,
+                       n=len(r.cells_with_errors)))
     if r.external_workbook_references:
-        risks.append(f"{len(r.external_workbook_references)} external workbook ref(s)")
+        risks.append(t("exec_summary.headline_risk_external", lang,
+                       n=len(r.external_workbook_references)))
     if r.circular_reference_suspects:
-        risks.append(f"{len(r.circular_reference_suspects)} circular suspect(s)")
+        risks.append(t("exec_summary.headline_risk_circular", lang,
+                       n=len(r.circular_reference_suspects)))
     if risks:
-        out.append("**Risks**: " + "; ".join(risks) + ".")
+        out.append(t("exec_summary.headline_risks", lang, risks="; ".join(risks)))
 
     return out[:3]
 
@@ -555,85 +914,101 @@ def _build_pillar_impact_mermaid(report) -> str:
 # Markdown body — per-section builders for reuse across MD/HTML
 # ---------------------------------------------------------------------------
 
-def _section_file_meta(report) -> list:
+def _md_table_header_lines(columns_key: str, lang: str) -> list:
+    """Build (header_row, separator_row) markdown lines from a `|`-joined
+    catalog value. Used for table-header keys."""
+    cols = split_pipe_columns(t(columns_key, lang))
+    return [
+        "| " + " | ".join(cols) + " |",
+        md_table_separator(len(cols)),
+    ]
+
+
+def _section_file_meta(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
     m = report.meta
-    L.append("## File metadata")
+    L.append(f"## {t('metadata.heading', lang)}")
     L.append("")
-    L.append("| Field | Value |")
-    L.append("|---|---|")
-    L.append(f"| File name | `{m.file_name}` |")
-    L.append(f"| File size | {m.file_size_bytes:,} bytes ({m.file_size_bytes/1024:.1f} KB) |")
-    L.append(f"| SHA-256 | `{m.sha256}` |")
+    L.extend(_md_table_header_lines("metadata.table_columns", lang))
+    L.append(f"| {t('metadata.row_filename', lang)} | `{m.file_name}` |")
+    L.append(
+        f"| {t('metadata.row_filesize', lang)} | "
+        + t("metadata.row_filesize_value", lang,
+            bytes_fmt=f"{m.file_size_bytes:,}", kb=f"{m.file_size_bytes/1024:.1f}")
+        + " |"
+    )
+    L.append(f"| {t('metadata.row_sha256', lang)} | `{m.sha256}` |")
     if report.sanitized:
-        L.append(f"| Sanitize mode | **active** (cell values redacted) |")
+        L.append(
+            f"| {t('metadata.row_sanitize', lang)} | "
+            f"{t('metadata.sanitize_value', lang)} |"
+        )
     L.append("")
     return L
 
 
-def _section_basic_stats(report) -> list:
+def _section_basic_stats(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
     b = report.basic_stats
-    L.append("## Basic statistics")
+    L.append(f"## {t('basic_stats.heading', lang)}")
     L.append("")
-    L.append("| Metric | Value |")
-    L.append("|---|---|")
-    L.append(f"| Sheet count (total) | {b.sheet_count} |")
-    L.append(f"| Sheet count visible / hidden / veryHidden | "
-             f"{b.sheet_count_visible} / {b.sheet_count_hidden} / {b.sheet_count_very_hidden} |")
-    L.append(f"| Non-empty cells | {b.cell_count_nonempty:,} |")
-    L.append(f"| Formula cells | {b.cell_count_formula:,} |")
-    L.append(f"| Unique non-formula values | {b.cell_count_unique_values:,} |")
-    L.append(f"| Named ranges | {b.named_range_count} |")
-    L.append(f"| Conditional formatting rules | {b.conditional_formatting_count} |")
-    L.append(f"| Data validation rules | {b.data_validation_count} |")
-    L.append(f"| VBA modules | {b.vba_module_count} |")
-    L.append(f"| VBA total lines | {b.vba_total_lines:,} |")
-    L.append(f"| Cell-level parse errors (logged + skipped) | {b.parse_errors_count} |")
+    L.extend(_md_table_header_lines("basic_stats.table_columns", lang))
+    L.append(f"| {t('basic_stats.row_sheet_count', lang)} | {b.sheet_count} |")
+    L.append(
+        f"| {t('basic_stats.row_sheet_visibility', lang)} | "
+        f"{b.sheet_count_visible} / {b.sheet_count_hidden} / {b.sheet_count_very_hidden} |"
+    )
+    L.append(f"| {t('basic_stats.row_cells_nonempty', lang)} | {b.cell_count_nonempty:,} |")
+    L.append(f"| {t('basic_stats.row_cells_formula', lang)} | {b.cell_count_formula:,} |")
+    L.append(f"| {t('basic_stats.row_unique_values', lang)} | {b.cell_count_unique_values:,} |")
+    L.append(f"| {t('basic_stats.row_named_ranges', lang)} | {b.named_range_count} |")
+    L.append(f"| {t('basic_stats.row_cf', lang)} | {b.conditional_formatting_count} |")
+    L.append(f"| {t('basic_stats.row_dv', lang)} | {b.data_validation_count} |")
+    L.append(f"| {t('basic_stats.row_vba_modules', lang)} | {b.vba_module_count} |")
+    L.append(f"| {t('basic_stats.row_vba_lines', lang)} | {b.vba_total_lines:,} |")
+    L.append(f"| {t('basic_stats.row_parse_errors', lang)} | {b.parse_errors_count} |")
     L.append("")
     return L
 
 
-def _section_sheets(report) -> list:
+def _section_sheets(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## Sheets")
+    L.append(f"## {t('sheets.heading', lang)}")
     L.append("")
-    L.append("| Sheet | State | Rows | Cols | Non-empty | Formula | Max ref | CF | DV |")
-    L.append("|---|---|---|---|---|---|---|---|---|")
+    L.extend(_md_table_header_lines("sheets.table_columns", lang))
+    dash = t("common.dash", lang)
     for s in report.sheets:
         L.append(
             f"| `{_md_escape(s.name)}` | {s.state} | {s.rows_used} | {s.cols_used} | "
-            f"{s.cells_nonempty} | {s.cells_formula} | {s.max_ref or '—'} | "
+            f"{s.cells_nonempty} | {s.cells_formula} | {s.max_ref or dash} | "
             f"{s.conditional_formatting_count} | {s.data_validation_count} |"
         )
     L.append("")
     return L
 
 
-def _section_named_ranges(report) -> list:
+def _section_named_ranges(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## Named ranges")
+    L.append(f"## {t('named_ranges.heading', lang)}")
     L.append("")
     if not report.named_ranges:
-        L.append("_No named ranges defined._")
+        L.append(f"_{t('named_ranges.none', lang)}_")
     else:
-        L.append("| Name | Scope | Reference |")
-        L.append("|---|---|---|")
+        L.extend(_md_table_header_lines("named_ranges.table_columns", lang))
         for nr in report.named_ranges:
             L.append(f"| `{_md_escape(nr.name)}` | `{_md_escape(nr.scope)}` | `{_md_escape(nr.ref)}` |")
     L.append("")
     return L
 
 
-def _section_complexity(report) -> list:
+def _section_complexity(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
     c = report.complexity
-    L.append("## Complexity score")
+    L.append(f"## {t('complexity.heading', lang)}")
     L.append("")
-    L.append(f"**Total: {c.total} / 100**")
+    L.append(f"**{t('complexity.total_label', lang, total=c.total)}**")
     L.append("")
-    L.append("| Sub-score | Value | Bar | Rationale |")
-    L.append("|---|---|---|---|")
+    L.extend(_md_table_header_lines("complexity.table_columns", lang))
     sub = c.sub_scores
     for key in sorted(c.rationale.keys()):
         val = getattr(sub, key)
@@ -643,145 +1018,137 @@ def _section_complexity(report) -> list:
     return L
 
 
-def _format_pillar_value_cell(p) -> str:
-    """Inline value display for the new Pillar table column (D1)."""
+def _format_pillar_value_cell(p, lang: str = DEFAULT_LANG) -> str:
+    """Inline value display for the Pillar table Value column (D1)."""
     v = (getattr(p, "value", "") or "").strip()
     kind = getattr(p, "value_kind", "")
     if not v:
-        return "_(empty)_"
+        return f"_{t('pillar.value_empty', lang)}_"
     if kind == "formula":
-        return f"`{_md_escape(v)}` (formula)"
-    if kind == "number":
-        return f"`{_md_escape(v)}`"
-    if kind == "text":
-        return f"`{_md_escape(v)}`"
+        return f"`{_md_escape(v)}`{t('pillar.value_formula_suffix', lang)}"
     return f"`{_md_escape(v)}`"
 
 
-def _format_pillar_label_cell(p) -> str:
+def _format_pillar_label_cell(p, lang: str = DEFAULT_LANG) -> str:
     """Combine row_header/col_header/named_range into one column."""
     parts: list = []
     rh = (getattr(p, "row_header", "") or "").strip()
     ch = (getattr(p, "col_header", "") or "").strip()
     nr = (getattr(p, "named_range", "") or "").strip()
     if nr:
-        parts.append(f"named range `{_md_escape(nr)}`")
+        parts.append(f"{t('pillar.label_named_range_prefix', lang)} `{_md_escape(nr)}`")
     if rh:
-        parts.append(f"row label `{_md_escape(rh[:25])}`")
+        parts.append(f"{t('pillar.label_row_prefix', lang)} `{_md_escape(rh[:25])}`")
     if ch and ch != rh:
-        parts.append(f"col header `{_md_escape(ch[:25])}`")
-    return "; ".join(parts) if parts else "—"
+        parts.append(f"{t('pillar.label_col_prefix', lang)} `{_md_escape(ch[:25])}`")
+    return "; ".join(parts) if parts else t("common.dash", lang)
 
 
 def _section_pillars(report, top_n: int = None, with_drilldown: bool = True,
-                     anchor_id: str = "") -> list:
+                     anchor_id: str = "", lang: str = DEFAULT_LANG) -> list:
     """Pillar table — D1 column update: Cell | Value | Label | Members | Fan-in | …
 
     `top_n`: when set, only render top-N rows (used by Top Impact Findings).
               When None, render all (used by Reference Appendix 8.1).
     """
     L: list = []
-    L.append("## Pillar cells — systemic single-points-of-impact")
+    L.append(f"## {t('pillar.heading', lang)}")
     L.append("")
-    L.append("_Cells with the highest fan-in (most-referenced). Modifying any of these "
-             "cascades through many formulas; treat them as critical change points. "
-             "Equivalent column cells (same fan-in, same affected sheets) are grouped._")
+    L.append(f"_{t('pillar.intro', lang)}_")
     L.append("")
-    L.append("_**What this means**: each row is a cell whose value flows into "
-             "many formulas — change it once, change many calculations at once. "
-             "The Value and Label columns answer Michael's #1 ask: \"what IS this cell?\"._")
+    L.append(f"_{t('pillar.what_this_means', lang)}_")
     L.append("")
     if not report.pillars:
-        L.append(f"_No cells reach the pillar threshold "
-                 f"(fan-in ≥ {report.methodology['logic_depth_thresholds']['pillar-fanin-min']})._")
+        threshold = report.methodology['logic_depth_thresholds']['pillar-fanin-min']
+        L.append(f"_{t('pillar.none_at_threshold', lang, threshold=threshold)}_")
         L.append("")
         return L
 
     rows = report.pillars if top_n is None else report.pillars[:top_n]
-    L.append("| Rank | Cell / range | Value | Label | Members | Fan-in | Affected sheets | Kind | Narrative |")
-    L.append("|---|---|---|---|---|---|---|---|---|")
+    L.extend(_md_table_header_lines("pillar.table_columns", lang))
     for i, p in enumerate(rows, start=1):
         sheets_str = ", ".join(f"`{s}`" for s in p.affected_sheets[:5])
         if len(p.affected_sheets) > 5:
-            sheets_str += f" (+{len(p.affected_sheets) - 5} more)"
+            sheets_str += t("common.more_suffix", lang, n=len(p.affected_sheets) - 5)
+        narrative = _render_pillar_narrative(p, lang)
         L.append(
-            f"| {i} | `{_md_escape(p.location)}` | {_format_pillar_value_cell(p)} | "
-            f"{_format_pillar_label_cell(p)} | {p.member_count} | {p.fan_in} | "
-            f"{sheets_str} | {p.pillar_kind} | {_md_escape(p.narrative)} |"
+            f"| {i} | `{_md_escape(p.location)}` | {_format_pillar_value_cell(p, lang)} | "
+            f"{_format_pillar_label_cell(p, lang)} | {p.member_count} | {p.fan_in} | "
+            f"{sheets_str} | {p.pillar_kind} | {_md_escape(narrative)} |"
         )
     if top_n is not None and len(report.pillars) > top_n:
         L.append("")
-        L.append(f"_({len(report.pillars) - top_n} more pillar(s) — see Reference Appendix §8.1.)_")
+        L.append(f"_{t('pillar.more_pillars', lang, n=len(report.pillars) - top_n)}_")
     L.append("")
     if with_drilldown:
-        L.append("**Top-5 pillar drilldown — sample dependents:**")
+        L.append(f"**{t('pillar.drilldown_heading', lang)}**")
         L.append("")
         for p in rows[:5]:
-            prefix = (f"`{p.location}` ({p.fan_in} dependents per cell × {p.member_count} cells)"
-                      if p.member_count > 1
-                      else f"`{p.location}` ({p.fan_in} dependents)")
+            if p.member_count > 1:
+                prefix = t("pillar.drilldown_group_label", lang,
+                           location=p.location, fan_in=p.fan_in,
+                           member_count=p.member_count)
+            else:
+                prefix = t("pillar.drilldown_single_label", lang,
+                           location=p.location, fan_in=p.fan_in)
             L.append(f"- **{prefix}**:")
             for d in p.sample_dependents:
                 L.append(f"    - `{d}`")
             if p.member_count > 1 and p.member_refs:
                 preview = ", ".join(f"`{r}`" for r in p.member_refs[:3])
-                extra = f" (+{len(p.member_refs) - 3} more)" if len(p.member_refs) > 3 else ""
-                L.append(f"    - _Group members:_ {preview}{extra}")
+                extra = (t("common.more_suffix", lang, n=len(p.member_refs) - 3)
+                         if len(p.member_refs) > 3 else "")
+                L.append(f"    - {t('pillar.group_members_label', lang, preview=preview, extra=extra)}")
         L.append("")
     return L
 
 
-def _section_anomalies(report) -> list:
+def _section_anomalies(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## Magic-number anomalies — outliers within formula clusters")
+    L.append(f"## {t('anomaly.heading', lang)}")
     L.append("")
-    L.append("_Inside groups of cells that share the same formula shape, this section "
-             "flags positions where a small minority uses a different numeric constant. "
-             "These are exactly the kind of \"why is this row's discount different?\" "
-             "findings that often indicate a missed update or a deliberate (but undocumented) "
-             "carve-out._")
+    L.append(f"_{t('anomaly.intro', lang)}_")
     L.append("")
     if not report.anomalies:
-        L.append("_No magic-number anomalies detected. Either no large duplicated-formula "
-                 "clusters were found, or every cluster's numeric constants are perfectly consistent._")
+        L.append(f"_{t('anomaly.none_detected', lang)}_")
         L.append("")
         return L
-    L.append("| # | Cluster sample | Cluster size | Mode value | Outlier value | Outlier locations | Confidence | Narrative |")
-    L.append("|---|---|---|---|---|---|---|---|")
+    L.extend(_md_table_header_lines("anomaly.table_columns", lang))
     for i, a in enumerate(report.anomalies, start=1):
         locs = ", ".join(f"`{loc}`" for loc in a.outlier_locations[:5])
         if len(a.outlier_locations) > 5:
-            locs += f" (+{len(a.outlier_locations) - 5} more)"
+            locs += t("common.more_suffix", lang, n=len(a.outlier_locations) - 5)
+        narrative = _render_anomaly_narrative(a, lang)
         L.append(
             f"| {i} | `{_md_escape(a.cluster_pattern_sample)}` | "
             f"{a.cluster_size} | `{_md_escape(a.mode_value)}` "
             f"({a.mode_count}/{a.cluster_size}) | "
             f"`{_md_escape(a.outlier_value)}` ({a.outlier_count}/{a.cluster_size}) | "
-            f"{locs} | {a.confidence} | {_md_escape(a.narrative)} |"
+            f"{locs} | {a.confidence} | {_md_escape(narrative)} |"
         )
     L.append("")
     return L
 
 
-def _section_smells(report) -> list:
+def _section_smells(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## Smells catalog (Hermans 2015)")
+    L.append(f"## {t('smells.heading', lang)}")
     L.append("")
-    L.append(f"_{len(report.smells)} smell findings across {len({s.smell_type for s in report.smells})} smell types._")
+    types_count = len({s.smell_type for s in report.smells})
+    L.append(f"_{t('smells.summary', lang, total=len(report.smells), types=types_count)}_")
     L.append("")
     by_type: dict = defaultdict(list)
     for s in report.smells:
         by_type[s.smell_type].append(s)
     for st in SMELL_TYPES:
         items = by_type.get(st, [])
-        L.append(f"### `{st}` — {len(items)} findings")
+        L.append(f"### {t('smells.subheading', lang, type=st, count=len(items))}")
         L.append("")
         if not items:
-            L.append("_No findings above threshold._")
+            L.append(f"_{t('smells.no_findings_threshold', lang)}_")
             L.append("")
             continue
-        L.append("| Location | Metric | Severity | Confidence | Evidence |")
-        L.append("|---|---|---|---|---|")
+        L.extend(_md_table_header_lines("smells.table_columns", lang))
         for s in items[:20]:
             L.append(
                 f"| `{_md_escape(s.location)}` | {s.metric:g} | {s.severity} | "
@@ -789,20 +1156,19 @@ def _section_smells(report) -> list:
             )
         if len(items) > 20:
             L.append("")
-            L.append(f"_({len(items)-20} more findings of this type — see `audit.json`.)_")
+            L.append(f"_{t('smells.more_findings', lang, n=len(items) - 20)}_")
         L.append("")
     return L
 
 
-def _section_magic_index(report) -> list:
+def _section_magic_index(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## Magic-number index (top 20)")
+    L.append(f"## {t('magic_index.heading', lang)}")
     L.append("")
     if not report.magic_numbers:
-        L.append("_No non-trivial numeric literals found._")
+        L.append(f"_{t('magic_index.none', lang)}_")
     else:
-        L.append("| Value | Count | First location | Source | Sample context |")
-        L.append("|---|---|---|---|---|")
+        L.extend(_md_table_header_lines("magic_index.table_columns", lang))
         for mn in report.magic_numbers:
             L.append(
                 f"| `{_md_escape(mn.value)}` | {mn.occurrence_count} | "
@@ -813,42 +1179,43 @@ def _section_magic_index(report) -> list:
     return L
 
 
-def _section_vba(report) -> list:
+def _section_vba(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## VBA modules + classification")
+    L.append(f"## {t('vba.heading', lang)}")
     L.append("")
     if not report.vba_modules:
-        L.append("_No VBA modules found._")
+        L.append(f"_{t('vba.no_modules_simple', lang)}_")
         L.append("")
         return L
     cls_by_name = {c.module_name: c for c in (report.vba_classifications or [])}
-    L.append("| Module | Type | LOC | #Sub | #Func | Inferred type | Confidence | Reads | Writes | Ext calls | OnErrorResumeNext |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    dash = t("common.dash", lang)
+    yes = t("common.yes", lang)
+    no = t("common.no", lang)
+    L.extend(_md_table_header_lines("vba.modules_table_columns", lang))
     for vm in report.vba_modules:
         n_sub = sum(1 for sf in vm.sub_functions if sf.kind == "Sub")
         n_func = sum(1 for sf in vm.sub_functions if sf.kind == "Function")
         cls = cls_by_name.get(vm.name)
-        inferred = cls.inferred_type if cls else "—"
-        cls_conf = cls.confidence if cls else "—"
-        reads = ", ".join(f"`{s}`" for s in (cls.reads_sheets if cls else [])) or "—"
-        writes = ", ".join(f"`{s}`" for s in (cls.writes_sheets if cls else [])) or "—"
-        ext_call = ("yes" if (cls and cls.external_calls) else "no") if cls else "—"
+        inferred = cls.inferred_type if cls else dash
+        cls_conf = cls.confidence if cls else dash
+        reads = ", ".join(f"`{s}`" for s in (cls.reads_sheets if cls else [])) or dash
+        writes = ", ".join(f"`{s}`" for s in (cls.writes_sheets if cls else [])) or dash
+        ext_call = (yes if (cls and cls.external_calls) else no) if cls else dash
         L.append(
             f"| `{_md_escape(vm.name)}` | {vm.type} | {vm.line_count} | "
             f"{n_sub} | {n_func} | **{inferred}** | {cls_conf} | "
             f"{_md_escape(reads)} | {_md_escape(writes)} | {ext_call} | "
-            f"{'yes' if vm.has_on_error_resume_next else 'no'} |"
+            f"{yes if vm.has_on_error_resume_next else no} |"
         )
     L.append("")
-    L.append("**VBA module details — external keywords & range literals:**")
+    L.append(f"**{t('vba.details_heading', lang)}**")
     L.append("")
-    L.append("| Module | External keywords | Range literals (uniq) | Classifier rationale |")
-    L.append("|---|---|---|---|")
+    L.extend(_md_table_header_lines("vba.details_table_columns", lang))
     for vm in report.vba_modules:
-        ext = ", ".join(vm.external_keywords) or "—"
+        ext = ", ".join(vm.external_keywords) or dash
         ranges = len(vm.range_literals)
         cls = cls_by_name.get(vm.name)
-        rationale = cls.rationale if cls else "—"
+        rationale = cls.rationale if cls else dash
         L.append(
             f"| `{_md_escape(vm.name)}` | {_md_escape(ext)} | {ranges} | "
             f"{_md_escape(rationale)} |"
@@ -857,37 +1224,42 @@ def _section_vba(report) -> list:
     return L
 
 
-def _section_risks(report) -> list:
+def _section_risks(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
     r = report.risk_indicators
-    L.append("## Risk indicators")
+    dash = t("common.dash", lang)
+    L.append(f"## {t('risks.heading', lang)}")
     L.append("")
-    L.append("| Indicator | Value |")
-    L.append("|---|---|")
-    L.append(f"| Hidden sheets | {len(r.hidden_sheets)} (`{', '.join(r.hidden_sheets) if r.hidden_sheets else '—'}`) |")
-    L.append(f"| Very-hidden sheets | {len(r.very_hidden_sheets)} (`{', '.join(r.very_hidden_sheets) if r.very_hidden_sheets else '—'}`) |")
-    L.append(f"| Cross-sheet referencing formulas | {r.cross_sheet_reference_count} |")
-    L.append(f"| Cells with formula errors (cached) | {len(r.cells_with_errors)} |")
-    L.append(f"| External workbook reference patterns | {len(r.external_workbook_references)} |")
-    L.append(f"| Circular reference suspects | {len(r.circular_reference_suspects)} |")
-    L.append(f"| Parse errors logged | {len(r.parse_errors)} |")
+    L.extend(_md_table_header_lines("risks.table_columns", lang))
+    L.append(
+        f"| {t('risks.row_hidden', lang)} | {len(r.hidden_sheets)} "
+        f"(`{', '.join(r.hidden_sheets) if r.hidden_sheets else dash}`) |"
+    )
+    L.append(
+        f"| {t('risks.row_very_hidden', lang)} | {len(r.very_hidden_sheets)} "
+        f"(`{', '.join(r.very_hidden_sheets) if r.very_hidden_sheets else dash}`) |"
+    )
+    L.append(f"| {t('risks.row_cross_sheet', lang)} | {r.cross_sheet_reference_count} |")
+    L.append(f"| {t('risks.row_errors', lang)} | {len(r.cells_with_errors)} |")
+    L.append(f"| {t('risks.row_external', lang)} | {len(r.external_workbook_references)} |")
+    L.append(f"| {t('risks.row_circular', lang)} | {len(r.circular_reference_suspects)} |")
+    L.append(f"| {t('risks.row_parse', lang)} | {len(r.parse_errors)} |")
     L.append("")
     if r.cells_with_errors:
-        L.append("**Formula error cells (first 20):**")
+        L.append(f"**{t('risks.errors_heading', lang)}**")
         L.append("")
-        L.append("| Sheet | Ref | Error |")
-        L.append("|---|---|---|")
+        L.extend(_md_table_header_lines("risks.errors_table_columns", lang))
         for ec in r.cells_with_errors[:20]:
             L.append(f"| `{_md_escape(ec['sheet'])}` | `{ec['ref']}` | `{ec['error_token']}` |")
         L.append("")
     if r.external_workbook_references:
-        L.append("**External workbook references:**")
+        L.append(f"**{t('risks.external_heading', lang)}**")
         L.append("")
         for ext in r.external_workbook_references[:20]:
             L.append(f"- `{_md_escape(ext)}`")
         L.append("")
     if r.circular_reference_suspects:
-        L.append("**Circular reference suspects (first 20):**")
+        L.append(f"**{t('risks.circular_heading', lang)}**")
         L.append("")
         for cs in r.circular_reference_suspects[:20]:
             L.append(f"- `{_md_escape(cs)}`")
@@ -895,30 +1267,29 @@ def _section_risks(report) -> list:
     return L
 
 
-def _section_diagrams(report) -> list:
+def _section_diagrams(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## Sheet data flow diagram")
+    L.append(f"## {t('diagrams.sheet_dataflow_heading', lang)}")
     L.append("")
-    L.append("_Cross-sheet formula references. Edge label = number of formulas with cross-sheet refs from source -> target sheet. "
-             "Yellow = hidden, red = veryHidden, default = visible._")
+    L.append(f"_{t('diagrams.sheet_dataflow_intro', lang)}_")
     L.append("")
     L.append("```mermaid")
     L.append(_build_sheet_dataflow_mermaid(report))
     L.append("```")
     L.append("")
 
-    L.append("## VBA classification overview diagram")
+    L.append(f"## {t('vba.classification_overview', lang)}")
     L.append("")
-    L.append("_Modules grouped under their inferred type._")
+    L.append(f"_{t('vba.diagram_overview_intro', lang)}_")
     L.append("")
     L.append("```mermaid")
     L.append(_build_vba_classification_mermaid(report))
     L.append("```")
     L.append("")
 
-    L.append("## Pillar impact diagram")
+    L.append(f"## {t('diagrams.pillar_impact_heading', lang)}")
     L.append("")
-    L.append(f"_Top-{_DIAG3_MAX_PILLARS} pillar cells and the sheets they cascade into._")
+    L.append(f"_{t('diagrams.pillar_impact_intro', lang, top_n=_DIAG3_MAX_PILLARS)}_")
     L.append("")
     L.append("```mermaid")
     L.append(_build_pillar_impact_mermaid(report))
@@ -927,48 +1298,30 @@ def _section_diagrams(report) -> list:
     return L
 
 
-def _section_methodology(report) -> list:
+def _section_methodology(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## Methodology")
+    L.append(f"## {t('methodology.heading', lang)}")
     L.append("")
     libs = report.methodology["library_versions"]
-    L.append(f"- Engine: `openpyxl` {libs['openpyxl']} (cells/structure), "
-             f"`oletools.olevba` {libs['oletools']} (VBA), "
-             f"`formulas` {libs['formulas']} (tokenizer only — no evaluator).")
+    L.append(f"- {t('methodology.engine', lang, openpyxl=libs['openpyxl'], oletools=libs['oletools'], formulas=libs['formulas'])}")
     thr = report.methodology["smell_thresholds"]
-    L.append(
-        f"- Smell thresholds: multiple-references ≥ {thr['multiple-references']}; "
-        f"long-calculation-chain depth ≥ {thr['long-calculation-chain']}; "
-        f"conditional-complexity nesting ≥ {thr['conditional-complexity']}; "
-        f"multiple-operations ≥ {thr['multiple-operations']}; "
-        f"duplicated-formulas pattern frequency ≥ {thr['duplicated-formulas']}."
-    )
+    L.append(f"- {t('methodology.smell_thresholds', lang, mr=thr['multiple-references'], lcc=thr['long-calculation-chain'], cc=thr['conditional-complexity'], mo=thr['multiple-operations'], df=thr['duplicated-formulas'])}")
     ld = report.methodology["logic_depth_thresholds"]
-    L.append(
-        f"- Logic-depth thresholds: pillar fan-in ≥ {ld['pillar-fanin-min']} (top {ld['pillar-top-n']} after dedupe); "
-        f"anomaly cluster size ≥ {ld['anomaly-cluster-min-size']}, outlier fraction ≤ {ld['anomaly-outlier-fraction']}."
-    )
-    L.append("- Pillar dedupe: cells in the same column with identical fan-in and identical "
-             "affected-sheet set are collapsed into one column-block entry. After dedupe we surface the top "
-             f"{ld['pillar-top-n']} distinct entries.")
-    L.append("- VBA classifier categories: " + ", ".join(f"`{c}`" for c in report.methodology["vba_classifier_categories"]) + ".")
-    L.append("- Confidence semantics: `high` = exact / deterministic count; "
-             "`medium` = tokenizer-based with well-defined rules; "
-             "`low` = statistical inference or analysis skipped due to scale.")
-    L.append("- Domain hint detector: pure keyword matching (case-insensitive, word-boundary) "
-             "against sheet names, named ranges, and VBA Sub/Function names. No LLM, no inference.")
-    L.append("- Trivial numbers excluded from magic-number index: " +
-             ", ".join(f"`{n}`" for n in sorted(TRIVIAL_NUMBERS)) + ".")
-    L.append("- Reliability contract: same input → byte-identical `audit.md`, `audit.json`, and `audit.html`. "
-             "All outputs use sorted dict keys and lexicographic list ordering. No timestamps. No CDN fetch at audit time.")
+    L.append(f"- {t('methodology.logic_depth', lang, pfm=ld['pillar-fanin-min'], ptn=ld['pillar-top-n'], acms=ld['anomaly-cluster-min-size'], aof=ld['anomaly-outlier-fraction'])}")
+    L.append(f"- {t('methodology.pillar_dedupe', lang, top_n=ld['pillar-top-n'])}")
+    cats = ", ".join(f"`{c}`" for c in report.methodology["vba_classifier_categories"])
+    L.append(f"- {t('methodology.vba_categories', lang, categories=cats)}")
+    L.append(f"- {t('methodology.confidence_semantics', lang)}")
+    L.append(f"- {t('methodology.domain_detector', lang)}")
+    nums = ", ".join(f"`{n}`" for n in sorted(TRIVIAL_NUMBERS))
+    L.append(f"- {t('methodology.trivial_numbers', lang, numbers=nums)}")
+    L.append(f"- {t('methodology.reliability', lang)}")
     if report.sanitized:
-        L.append("- **Sanitize mode active**: every non-formula cell value has been replaced with "
-                 "`<redacted>` before any analysis ran. Formulas, VBA source, smells, pillars, anomalies, "
-                 "and structural counts remain accurate. The SHA-256 above is of the original file.")
+        L.append(f"- {t('methodology.sanitize_active', lang)}")
     L.append("")
     L.append("---")
     L.append("")
-    L.append("_End of report._")
+    L.append(f"_{t('methodology.end_of_report', lang)}_")
     return L
 
 
@@ -977,54 +1330,54 @@ def _section_methodology(report) -> list:
 # Domain Findings / Top Impact Findings / Glossary.
 # ---------------------------------------------------------------------------
 
-def _section_workflow_guide(report) -> list:
+def _section_workflow_guide(report, lang: str = DEFAULT_LANG) -> list:
     """D3: Workflow Guide — operational walkthrough.
 
     Derived from xl/drawings + VBA structure. When NO buttons + NO event
     handlers, the section reports "no buttons detected" gracefully.
     """
     L: list = []
-    L.append("## Workflow Guide")
+    L.append(f"## {t('workflow.heading', lang)}")
     L.append("")
-    L.append("_Inferred from the workbook's VBA structure and embedded form-control "
-             "buttons (no AI). This is how the workbook is operationally used._")
+    L.append(f"_{t('workflow.intro', lang)}_")
     L.append("")
-    L.append("_**What this means**: the steps below describe the sequence a user "
-             "follows — typically: open the workbook, enter inputs, click button(s), "
-             "read the resulting cells. This is structural inference; semantic "
-             "narrative (e.g. \"this calculates capacity utilization\") would require "
-             "Track B LLM augmentation._")
+    L.append(f"_{t('workflow.what_this_means', lang)}_")
     L.append("")
     wf = (getattr(report, "workflow", None) or {})
     steps = wf.get("steps") or []
 
     if not steps:
-        L.append("_No user-callable buttons or event handlers detected — this "
-                 "workbook appears to be formula-driven only (no macro entry points "
-                 "found in `xl/drawings/*` or VBA event subs). Users would interact "
-                 "with the workbook by editing input cells and reading formula "
-                 "outputs directly._")
+        L.append(f"_{t('workflow.no_buttons', lang)}_")
         L.append("")
         return L
 
     for s in steps:
         L.append(f"<!-- LLM-AUGMENT: workflow-step:{s.order} -->")
-        L.append(f"**Step {s.order}**: User clicks button **{_md_escape(s.label or s.sub_name)}** "
-                 f"on sheet `{_md_escape(s.sheet)}` (bound to "
-                 f"`{_md_escape(s.module_name)}.{_md_escape(s.sub_name)}`).")
+        L.append(t("workflow.step_line", lang,
+                   order=s.order,
+                   label=_md_escape(s.label or s.sub_name),
+                   sheet=_md_escape(s.sheet),
+                   module_name=_md_escape(s.module_name),
+                   sub_name=_md_escape(s.sub_name)))
         if s.reads_sheets:
-            L.append(f"- Reads: " + ", ".join(f"`{_md_escape(r)}`" for r in s.reads_sheets[:5])
-                     + (f" (+{len(s.reads_sheets)-5} more)" if len(s.reads_sheets) > 5 else ""))
+            joined = ", ".join(f"`{_md_escape(r)}`" for r in s.reads_sheets[:5])
+            extra = (t("common.more_suffix", lang, n=len(s.reads_sheets) - 5)
+                     if len(s.reads_sheets) > 5 else "")
+            L.append(f"- {t('workflow.reads_label', lang)}: {joined}{extra}")
         if s.writes_sheets:
-            L.append(f"- Writes: " + ", ".join(f"`{_md_escape(w)}`" for w in s.writes_sheets[:5])
-                     + (f" (+{len(s.writes_sheets)-5} more)" if len(s.writes_sheets) > 5 else ""))
+            joined = ", ".join(f"`{_md_escape(w)}`" for w in s.writes_sheets[:5])
+            extra = (t("common.more_suffix", lang, n=len(s.writes_sheets) - 5)
+                     if len(s.writes_sheets) > 5 else "")
+            L.append(f"- {t('workflow.writes_label', lang)}: {joined}{extra}")
         if s.calls:
-            L.append(f"- Calls: " + ", ".join(f"`{_md_escape(c)}`" for c in s.calls[:5])
-                     + (f" (+{len(s.calls)-5} more)" if len(s.calls) > 5 else ""))
+            joined = ", ".join(f"`{_md_escape(c)}`" for c in s.calls[:5])
+            extra = (t("common.more_suffix", lang, n=len(s.calls) - 5)
+                     if len(s.calls) > 5 else "")
+            L.append(f"- {t('workflow.calls_label', lang)}: {joined}{extra}")
         L.append("")
 
     # Mermaid sequence diagram
-    L.append("**Workflow sequence diagram**:")
+    L.append(f"**{t('workflow.sequence_heading', lang)}**:")
     L.append("")
     L.append("```mermaid")
     L.append(_build_workflow_mermaid(report))
@@ -1033,22 +1386,18 @@ def _section_workflow_guide(report) -> list:
     return L
 
 
-def _section_data_flow_story(report) -> list:
+def _section_data_flow_story(report, lang: str = DEFAULT_LANG) -> list:
     """D5: Data Flow Story — per-sheet prose paragraph (top 8 by density).
 
     Renders BEFORE the existing Mermaid sheet-flow diagram (which becomes
     "evidence" for this prose).
     """
     L: list = []
-    L.append("## Data Flow Story")
+    L.append(f"## {t('data_flow.heading', lang)}")
     L.append("")
-    L.append("_Plain-language description of how data flows between sheets, before "
-             "the schematic diagram. Derived from formula cross-sheet references and "
-             "VBA write targets._")
+    L.append(f"_{t('data_flow.intro', lang)}_")
     L.append("")
-    L.append("_**What this means**: each paragraph below tells you whether a sheet "
-             "is **input** (user types here), **derived** (populated by formulas or "
-             "macros), or **mixed** — and where its values come from / go to._")
+    L.append(f"_{t('data_flow.what_this_means', lang)}_")
     L.append("")
 
     # Sort sheets by combined density: cells_nonempty + cells_formula
@@ -1090,9 +1439,12 @@ def _section_data_flow_story(report) -> list:
 
     for s in top_sheets:
         L.append(f"<!-- LLM-AUGMENT: data-flow:{s.name} -->")
-        L.append(f"### `{_md_escape(s.name)}` ({s.state}, "
-                 f"{s.rows_used} rows × {s.cols_used} cols, "
-                 f"{s.cells_nonempty} non-empty cells)")
+        L.append("### " + t("data_flow.sheet_header", lang,
+                            name=_md_escape(s.name),
+                            state=s.state,
+                            rows=s.rows_used,
+                            cols=s.cols_used,
+                            cells_nonempty=s.cells_nonempty))
         # Role inference
         n_in = sum(c for _, c in incoming.get(s.name, []))
         n_out = sum(c for _, c in outgoing.get(s.name, []))
@@ -1100,52 +1452,47 @@ def _section_data_flow_story(report) -> list:
         n_vba_writes = len(vba_writes_by_sheet.get(s.name, []))
 
         if n_form == 0 and n_in == 0 and n_vba_writes == 0:
-            role = ("**input sheet** — no formulas, no inbound cross-sheet "
-                    "references, no VBA writes. Likely user-driven manual entry.")
+            role = t("data_flow.role_input", lang)
         elif n_form == 0 and (n_in > 0 or n_vba_writes > 0):
-            role = ("**derived sheet (no formulas)** — populated by VBA macros "
-                    "or referenced as a source by other sheets but contains only values.")
+            role = t("data_flow.role_derived_no_formulas", lang)
         elif n_form > 0 and n_out > n_in:
-            role = ("**aggregator/output sheet** — many of its formulas pull from "
-                    "other sheets; downstream usage limited.")
+            role = t("data_flow.role_aggregator", lang)
         elif n_form > 0:
-            role = ("**computed sheet** — populated by formulas with cross-sheet "
-                    "lookups.")
+            role = t("data_flow.role_computed", lang)
         else:
-            role = "**mixed**."
-        L.append(f"**Role**: {role}")
+            role = t("data_flow.role_mixed", lang)
+        L.append(t("data_flow.role_line", lang, role=role))
 
         # Sources / consumers
         if outgoing.get(s.name):
             srcs = ", ".join(f"`{src}` ({cnt})" for src, cnt in outgoing[s.name][:4])
-            L.append(f"**Sources** (formulas in this sheet read from): {srcs}.")
+            L.append(t("data_flow.sources_line", lang, sources=srcs))
         if incoming.get(s.name):
             tgts = ", ".join(f"`{tgt}` ({cnt})" for tgt, cnt in incoming[s.name][:4])
-            L.append(f"**Consumers** (other sheets reading this one): {tgts}.")
+            L.append(t("data_flow.consumers_line", lang, consumers=tgts))
         if n_vba_writes > 0:
             mods = vba_writes_by_sheet[s.name][:3]
             mods_str = ", ".join(f"`{m}`" for m in mods)
-            extra = f" (+{n_vba_writes-3} more)" if n_vba_writes > 3 else ""
-            L.append(f"**VBA writes to this sheet**: {mods_str}{extra}.")
+            extra = (t("common.more_suffix", lang, n=n_vba_writes - 3)
+                     if n_vba_writes > 3 else "")
+            L.append(t("data_flow.vba_writes_line", lang, modules=mods_str, extra=extra))
         if pillar_count_by_sheet.get(s.name):
-            L.append(f"**Pillar cells**: {pillar_count_by_sheet[s.name]} cell(s) "
-                     "in this sheet are pillars (high fan-in change points).")
+            L.append(t("data_flow.pillar_count_line", lang,
+                       count=pillar_count_by_sheet[s.name]))
         if err_cells_by_sheet.get(s.name):
             ec = err_cells_by_sheet[s.name][:1][0]
-            L.append(f"**Manual override risk**: cell `{ec['ref']}` has cached error "
-                     f"`{ec['error_token']}` — see Risk indicators §8.6.")
+            L.append(t("data_flow.manual_override_line", lang,
+                       ref=ec['ref'], error_token=ec['error_token']))
         L.append("")
 
     if len(report.sheets) > len(top_sheets):
-        L.append(f"_({len(report.sheets) - len(top_sheets)} more sheet(s) — full table in §8.3.)_")
+        L.append(f"_{t('data_flow.more_sheets', lang, n=len(report.sheets) - len(top_sheets))}_")
         L.append("")
 
     # The schematic diagram
-    L.append("**Sheet data flow diagram**:")
+    L.append(f"**{t('data_flow.diagram_heading', lang)}**:")
     L.append("")
-    L.append("_Cross-sheet formula references. Edge label = number of formulas "
-             "with cross-sheet refs from source -> target sheet. "
-             "Yellow = hidden, red = veryHidden._")
+    L.append(f"_{t('data_flow.diagram_intro', lang)}_")
     L.append("")
     L.append("```mermaid")
     L.append(_build_sheet_dataflow_mermaid(report))
@@ -1154,52 +1501,47 @@ def _section_data_flow_story(report) -> list:
     return L
 
 
-def _section_top_impact_findings(report) -> list:
+def _section_top_impact_findings(report, lang: str = DEFAULT_LANG) -> list:
     """Top Impact Findings — Top-5 each of pillars / anomalies / smells / risks.
 
     SHORT and READABLE — appendix has the full data.
     """
     L: list = []
-    L.append("## Top Impact Findings")
+    L.append(f"## {t('top_impact.heading', lang)}")
     L.append("")
-    L.append("_Top-N filtered list across pillars, anomalies, smells, and risks. "
-             "Full catalogs live in the Reference Appendix (§8)._")
+    L.append(f"_{t('top_impact.intro', lang)}_")
     L.append("")
 
     # Pillars (top 5)
-    L.append("### Top-5 Pillar Cells (single-points-of-impact)")
+    L.append(f"### {t('top_impact.pillars_heading', lang)}")
     L.append("")
     if not report.pillars:
-        L.append("_No pillar cells detected._")
+        L.append(f"_{t('top_impact.no_pillars', lang)}_")
     else:
-        L.append("| # | Cell / range | Value | Label | Fan-in | Affected sheets |")
-        L.append("|---|---|---|---|---|---|")
+        L.extend(_md_table_header_lines("pillar.table_columns_short", lang))
         for i, p in enumerate(report.pillars[:5], start=1):
             sheets_str = ", ".join(f"`{s}`" for s in p.affected_sheets[:3])
             if len(p.affected_sheets) > 3:
                 sheets_str += f" (+{len(p.affected_sheets)-3})"
             L.append(
-                f"| {i} | `{_md_escape(p.location)}` | {_format_pillar_value_cell(p)} | "
-                f"{_format_pillar_label_cell(p)} | {p.fan_in} | {sheets_str} |"
+                f"| {i} | `{_md_escape(p.location)}` | {_format_pillar_value_cell(p, lang)} | "
+                f"{_format_pillar_label_cell(p, lang)} | {p.fan_in} | {sheets_str} |"
             )
         L.append("")
-        L.append("_See §8.1 for the full pillar table; each row's narrative explains "
-                 "the cell's role and impact._")
+        L.append(f"_{t('top_impact.pillars_see_full', lang)}_")
     L.append("")
 
     # Anomalies (top 5)
-    L.append("### Top-5 Magic-number Anomalies (cluster outliers)")
+    L.append(f"### {t('top_impact.anomalies_heading', lang)}")
     L.append("")
     if not report.anomalies:
-        L.append("_No magic-number anomalies detected. Either no large duplicated-formula "
-                 "clusters, or every cluster's numbers are perfectly consistent._")
+        L.append(f"_{t('top_impact.no_anomalies', lang)}_")
     else:
-        L.append("| # | Cluster size | Mode | Outlier | Outlier locations | Confidence |")
-        L.append("|---|---|---|---|---|---|")
+        L.extend(_md_table_header_lines("anomaly.table_columns_short", lang))
         for i, a in enumerate(report.anomalies[:5], start=1):
             locs = ", ".join(f"`{loc}`" for loc in a.outlier_locations[:3])
             if len(a.outlier_locations) > 3:
-                locs += f" (+{len(a.outlier_locations)-3} more)"
+                locs += t("common.more_suffix", lang, n=len(a.outlier_locations) - 3)
             L.append(
                 f"| {i} | {a.cluster_size} | `{_md_escape(a.mode_value)}` "
                 f"({a.mode_count}/{a.cluster_size}) | "
@@ -1209,13 +1551,12 @@ def _section_top_impact_findings(report) -> list:
     L.append("")
 
     # Top smells (top 5 by metric)
-    L.append("### Top-5 Smell Findings")
+    L.append(f"### {t('top_impact.smells_heading', lang)}")
     L.append("")
-    L.append("_**What this means**: code-smell categories from Hermans 2015. "
-             "Not bugs — patterns that often indicate maintainability risk._")
+    L.append(f"_{t('top_impact.smells_what_this_means', lang)}_")
     L.append("")
     if not report.smells:
-        L.append("_No smells above threshold._")
+        L.append(f"_{t('top_impact.no_smells', lang)}_")
     else:
         # Dedupe by (smell_type, metric, sheet) so the Top-5 surfaces distinct
         # findings rather than 5 cells from the same column with identical metric.
@@ -1231,70 +1572,63 @@ def _section_top_impact_findings(report) -> list:
             top_smells.append(s)
             if len(top_smells) >= 5:
                 break
-        L.append("| # | Type | Location | Metric | Severity | Evidence |")
-        L.append("|---|---|---|---|---|---|")
+        L.extend(_md_table_header_lines("smells.short_table_columns", lang))
         for i, s in enumerate(top_smells, start=1):
             L.append(
                 f"| {i} | `{s.smell_type}` | `{_md_escape(s.location)}` | "
                 f"{s.metric:g} | {s.severity} | {_md_escape(s.evidence)} |"
             )
         L.append("")
-        L.append("_Full smell catalog: §8.2._")
+        L.append(f"_{t('top_impact.smells_full', lang)}_")
     L.append("")
 
     # Top risks
-    L.append("### Top Risk Indicators")
+    L.append(f"### {t('top_impact.risks_heading', lang)}")
     L.append("")
     r = report.risk_indicators
     risk_lines: list = []
     if r.very_hidden_sheets:
-        risk_lines.append(f"- **{len(r.very_hidden_sheets)} veryHidden sheet(s)**: "
-                          f"`{', '.join(r.very_hidden_sheets)}` — invisible in Excel "
-                          f"UI even via Hide/Unhide menu; only VBA reveals them.")
+        risk_lines.append(t("top_impact.risk_very_hidden", lang,
+                            n=len(r.very_hidden_sheets),
+                            names=', '.join(r.very_hidden_sheets)))
     if r.hidden_sheets:
-        risk_lines.append(f"- **{len(r.hidden_sheets)} hidden sheet(s)**: "
-                          f"`{', '.join(r.hidden_sheets)}` — not visible by default "
-                          f"but can be unhidden via right-click.")
+        risk_lines.append(t("top_impact.risk_hidden", lang,
+                            n=len(r.hidden_sheets),
+                            names=', '.join(r.hidden_sheets)))
     if r.cells_with_errors:
-        risk_lines.append(f"- **{len(r.cells_with_errors)} cell(s) with cached "
-                          f"formula errors** (e.g. #REF!, #N/A) — see §8.6.")
+        risk_lines.append(t("top_impact.risk_errors", lang,
+                            n=len(r.cells_with_errors)))
     if r.external_workbook_references:
-        risk_lines.append(f"- **{len(r.external_workbook_references)} external workbook "
-                          f"reference pattern(s)** — fragile cross-file links.")
+        risk_lines.append(t("top_impact.risk_external", lang,
+                            n=len(r.external_workbook_references)))
     if r.circular_reference_suspects:
-        risk_lines.append(f"- **{len(r.circular_reference_suspects)} circular "
-                          f"reference suspect(s)** — see §8.6.")
+        risk_lines.append(t("top_impact.risk_circular", lang,
+                            n=len(r.circular_reference_suspects)))
     if not risk_lines:
-        L.append("_No high-priority risk indicators._")
+        L.append(f"_{t('top_impact.no_risks', lang)}_")
     else:
         for line in risk_lines:
-            L.append(line)
+            L.append(f"- {line}")
     L.append("")
     return L
 
 
-def _section_vba_walkthrough(report) -> list:
+def _section_vba_walkthrough(report, lang: str = DEFAULT_LANG) -> list:
     """D4: VBA Module Walkthrough — prose narration in call order.
 
     Each module gets a paragraph; modules with no callers flagged as
     "possibly dead code". LLM-AUGMENT markers reserve the slot for Track B.
     """
     L: list = []
-    L.append("## VBA Module Walkthrough")
+    L.append(f"## {t('vba.heading_walkthrough', lang)}")
     L.append("")
-    L.append("_Per-module heuristic narrative, ordered by call-graph dependency from "
-             "user-callable entry points (button-bound + event handlers). "
-             "**This is structural narration, not semantic** — we report what reads/"
-             "writes and what calls what, but not what the code MEANS for the business "
-             "(that's Track B / LLM augmentation)._")
+    L.append(f"_{t('vba.walkthrough_intro', lang)}_")
     L.append("")
-    L.append("_**What this means**: each module gets a 4-line summary: structural role, "
-             "what it does (sheets it reads/writes, modules it calls), notable patterns "
-             "(error handling, magic numbers, loops), and call relationships._")
+    L.append(f"_{t('vba.walkthrough_what_this_means', lang)}_")
     L.append("")
     narratives = report.vba_narratives or []
     if not narratives:
-        L.append("_No VBA modules to narrate._")
+        L.append(f"_{t('vba.no_modules', lang)}_")
         L.append("")
         return L
 
@@ -1313,76 +1647,70 @@ def _section_vba_walkthrough(report) -> list:
         ordered = sorted(unreachable, key=lambda n: -n.line_count)
         narratives_to_show = ordered[:REACHABLE_MAX]
         truly_dead = [n for n in unreachable if n not in narratives_to_show]
-        L.append("_No buttons or event handlers detected, so no call-graph entry "
-                 "point — modules below are ranked by LOC (a structural proxy "
-                 "for likely importance). Each module is flagged as 'possibly "
-                 "dead code' since static analysis can't confirm reachability "
-                 "without an entry point._")
+        L.append(f"_{t('vba.no_entry_caveat', lang)}_")
         L.append("")
-        L.append("_**Caveat for many-dead-modules workbooks**: when a large fraction "
-                 "of modules are flagged 'possibly dead', the VBA may be inherited "
-                 "from another project (donor code), left from prior workbook "
-                 "iterations, or genuinely orphaned. Static analysis cannot "
-                 "disambiguate — Track B (LLM-augmented) reads the code to tell. "
-                 "For now, treat 'possibly dead' as 'no entry point detected', "
-                 "not 'definitely unused'._")
+        L.append(f"_{t('vba.many_dead_caveat', lang)}_")
         L.append("")
         for narr in narratives_to_show:
             L.append(f"<!-- LLM-AUGMENT: vba-narration:{narr.module_name} -->")
-            L.append(f"### `{_md_escape(narr.module_name)}` "
-                     f"({narr.inferred_type}, {narr.line_count} lines)")
+            L.append("### " + t("vba.module_heading", lang,
+                                name=_md_escape(narr.module_name),
+                                inferred_type=narr.inferred_type,
+                                line_count=narr.line_count))
             L.append("")
-            L.append(narr.narrative)
+            L.append(_render_vba_narrative(narr, lang))
             L.append("")
         if truly_dead:
-            L.append(f"### Possibly dead code ({len(truly_dead)} additional module(s))")
+            L.append("### " + t("vba.dead_code_heading", lang, n=len(truly_dead)))
             L.append("")
             sample = truly_dead[:8]
             for narr in sample:
                 L.append(f"<!-- LLM-AUGMENT: vba-narration:{narr.module_name} -->")
-                L.append(f"- `{_md_escape(narr.module_name)}` "
-                         f"({narr.inferred_type}, {narr.line_count} lines, "
-                         f"{narr.sub_count + narr.func_count} subs/funcs)")
+                L.append("- " + t("vba.dead_module_bullet", lang,
+                                  name=_md_escape(narr.module_name),
+                                  inferred_type=narr.inferred_type,
+                                  line_count=narr.line_count,
+                                  sub_func_count=narr.sub_count + narr.func_count))
             if len(truly_dead) > len(sample):
-                L.append(f"- _(+{len(truly_dead) - len(sample)} more — see §8.7.)_")
+                L.append("- " + f"_{t('vba.more_dead', lang, n=len(truly_dead) - len(sample))}_")
             L.append("")
         return L
 
     reachable_show = reachable[:REACHABLE_MAX]
     for narr in reachable_show:
         L.append(f"<!-- LLM-AUGMENT: vba-narration:{narr.module_name} -->")
-        L.append(f"### `{_md_escape(narr.module_name)}` "
-                 f"({narr.inferred_type}, {narr.line_count} lines)")
+        L.append("### " + t("vba.module_heading", lang,
+                            name=_md_escape(narr.module_name),
+                            inferred_type=narr.inferred_type,
+                            line_count=narr.line_count))
         L.append("")
-        L.append(narr.narrative)
+        L.append(_render_vba_narrative(narr, lang))
         L.append("")
 
     if len(reachable) > REACHABLE_MAX:
-        L.append(f"_({len(reachable) - REACHABLE_MAX} more reachable module(s) — "
-                 f"see Reference Appendix §8.7 VBA modules table for full list.)_")
+        L.append(f"_{t('vba.more_reachable', lang, n=len(reachable) - REACHABLE_MAX)}_")
         L.append("")
 
     if unreachable:
-        L.append(f"### Possibly dead code ({len(unreachable)} module(s))")
+        L.append("### " + t("vba.dead_code_heading_alt", lang, n=len(unreachable)))
         L.append("")
-        L.append("_The following modules are not reached from any detected button "
-                 "or event handler. They may be legacy code, helper libraries pulled "
-                 "in but unused, or detection misses (ActiveX controls, dynamic VBA "
-                 "calls). Audit before deleting._")
+        L.append(f"_{t('vba.dead_code_intro', lang)}_")
         L.append("")
         sample = unreachable[:8]
         for narr in sample:
             L.append(f"<!-- LLM-AUGMENT: vba-narration:{narr.module_name} -->")
-            L.append(f"- `{_md_escape(narr.module_name)}` "
-                     f"({narr.inferred_type}, {narr.line_count} lines, "
-                     f"{narr.sub_count + narr.func_count} subs/funcs)")
+            L.append("- " + t("vba.dead_module_bullet", lang,
+                              name=_md_escape(narr.module_name),
+                              inferred_type=narr.inferred_type,
+                              line_count=narr.line_count,
+                              sub_func_count=narr.sub_count + narr.func_count))
         if len(unreachable) > len(sample):
-            L.append(f"- _(+{len(unreachable) - len(sample)} more — see §8.7.)_")
+            L.append("- " + f"_{t('vba.more_dead', lang, n=len(unreachable) - len(sample))}_")
         L.append("")
     return L
 
 
-def _section_domain_findings(report) -> list:
+def _section_domain_findings(report, lang: str = DEFAULT_LANG) -> list:
     """D7: Domain-Specific Findings — only present when ≥1 template fired."""
     L: list = []
     matches = (report.domain_template_matches or [])
@@ -1391,198 +1719,91 @@ def _section_domain_findings(report) -> list:
     if not matches:
         return []  # caller skips section
 
-    L.append("## Domain-Specific Findings")
+    L.append(f"## {t('domain_findings.heading', lang)}")
     L.append("")
-    L.append("_Detected domain templates (e.g. manufacturing/capacity-planning, "
-             "logistics/routing). For each, we cross-checked the workbook against "
-             "industry-known hardcoded-risk constants and scheduling-method hallmarks._")
+    L.append(f"_{t('domain_findings.intro', lang)}_")
     L.append("")
-    L.append("_**What this means**: domain templates pre-populate \"things to look "
-             "for\" specific to a vertical. They're a heuristic checklist, not a "
-             "verdict — every hit deserves a closer look but isn't necessarily a bug._")
+    L.append(f"_{t('domain_findings.what_this_means', lang)}_")
     L.append("")
 
     for m in matches:
         L.append(f"<!-- LLM-AUGMENT: domain-method:{m.template_key} -->")
-        L.append(f"### {m.business_friendly_name}  "
-                 f"_(confidence: {m.confidence})_")
+        L.append("### " + t("domain_findings.template_heading", lang,
+                            name=m.business_friendly_name,
+                            confidence=m.confidence))
         L.append("")
         if m.matched_keywords:
-            L.append("**Matched keywords**: " + ", ".join(f"`{k}`" for k in m.matched_keywords) + ".")
+            kw_str = ", ".join(f"`{k}`" for k in m.matched_keywords)
+            L.append(t("domain_findings.matched_keywords", lang, keywords=kw_str))
             L.append("")
 
         if m.sheet_role_hits:
-            L.append("**Expected sheet roles found in this workbook**:")
+            L.append(t("domain_findings.expected_roles_found", lang))
             for role, sheets in m.sheet_role_hits:
-                L.append(f"- `{role}` — present as {sheets}")
+                L.append("- " + t("domain_findings.role_present", lang,
+                                  role=role, sheets=sheets))
             L.append("")
         if m.sheet_role_misses:
-            L.append("**Expected sheet roles NOT found**:")
+            L.append(t("domain_findings.expected_roles_missing", lang))
             for role in m.sheet_role_misses[:5]:
-                L.append(f"- `{role}` — no sheet name matches; confirm whether absent or named differently")
+                L.append("- " + t("domain_findings.role_missing", lang, role=role))
             L.append("")
 
         if m.hardcode_risk_hits:
-            L.append("**Common hardcode risks (potential hits)**:")
+            L.append(t("domain_findings.hardcode_risks_heading", lang))
             for label, evidence in m.hardcode_risk_hits:
-                L.append(f"- **{label}** — evidence: {evidence}")
+                L.append("- " + t("domain_findings.hardcode_risk_item", lang,
+                                  label=label, evidence=evidence))
             L.append("")
         else:
-            L.append("**Common hardcode risks**: no clear matches found in pillars / "
-                     "magic-number index. Either the risks aren't present or are "
-                     "named differently.")
+            L.append(t("domain_findings.hardcode_risks_none", lang))
             L.append("")
 
         if m.method_hits:
-            L.append("**Scheduling methods detected (hallmark keywords)**:")
+            L.append(t("domain_findings.method_hits_heading", lang))
             for label, evidence in m.method_hits:
-                L.append(f"- **{label}** — evidence: {evidence}")
+                L.append("- " + t("domain_findings.method_hits_item", lang,
+                                  label=label, evidence=evidence))
             L.append("")
     return L
 
 
-_GLOSSARY_TERMS = {
-    "anomaly (magic-number)": (
-        "Inside a cluster of cells sharing the same formula shape, a position "
-        "where a small minority uses a different numeric constant. Often "
-        "signals a missed update or undocumented carve-out."
-    ),
-    "audit": (
-        "The full report this tool produces — markdown + JSON + HTML — for one "
-        "xlsm workbook. Pure static analysis, zero LLM, zero network."
-    ),
-    "BYOA (Bring Your Own AI)": (
-        "Distribution model where the customer uses their own LLM "
-        "subscription. We do not call any LLM; we just package context "
-        "for them to paste into Copilot / Claude / etc."
-    ),
-    "column-block (pillar)": (
-        "When N cells in the same column share the same fan-in count and the "
-        "same set of dependent sheets, we collapse them into one pillar entry "
-        "with `member_count = N` instead of N separate rows."
-    ),
-    "complexity score": (
-        "A 0-100 composite of 5 sub-scores (data scale, formula depth, "
-        "metadata complexity, smell density, VBA mass). Higher = harder to "
-        "refactor."
-    ),
-    "confidence (high/medium/low)": (
-        "How certain we are about a finding. `high` = exact deterministic "
-        "count; `medium` = tokenizer-based with well-defined rules; "
-        "`low` = statistical inference or analysis skipped."
-    ),
-    "data-loader / transformer / report-writer / ui-handler": (
-        "VBA module classifications based on Sub/Function naming patterns "
-        "(`Load*`, `Calc*`, `Print*`, `*_Click`) and structural counts "
-        "(reads/writes/loops). Heuristic only."
-    ),
-    "dead-suspected (VBA)": (
-        "A module with no Sub calls, no value writes, no name signals — "
-        "likely empty or unused. May still be reachable through dynamic "
-        "VBA calls; verify before deleting."
-    ),
-    "domain": (
-        "An industry vertical we detected via keyword matching: "
-        "capacity-planning / inventory-supply-chain / logistics-routing / "
-        "operations-s&op / actuarial-insurance / financial-modeling. "
-        "Triggers domain-specific sections when matched."
-    ),
-    "duplicated-formulas": (
-        "Cells whose normalized formula pattern appears in many places. Often "
-        "legitimate (column-fill), but can hide outliers — see Magic-number "
-        "Anomalies."
-    ),
-    "fan-in": (
-        "How many distinct formulas reference a given cell. Higher fan-in = "
-        "modifying that cell ripples through more calculations."
-    ),
-    "formula relay (pillar)": (
-        "A pillar cell that itself is a formula — others read its result, "
-        "and it is itself derived. Modifying the formula changes downstream "
-        "derivations."
-    ),
-    "Hermans smells": (
-        "Spreadsheet code-smell catalog from Felienne Hermans's 2015 paper "
-        "(multiple-references, conditional-complexity, multiple-operations, "
-        "duplicated-formulas, magic-numbers, long-calculation-chain)."
-    ),
-    "incoming / outgoing (cell)": (
-        "Cell A's `incoming` set is every cell whose formula reads A. "
-        "Cell A's `outgoing` set is every cell A's formula reads. Together "
-        "they form the cell-level dataflow graph."
-    ),
-    "LLM-AUGMENT marker": (
-        "An HTML comment like `<!-- LLM-AUGMENT: vba-narration:Module1 -->` "
-        "marking a section a future Track B (LLM) ingest step can replace "
-        "with richer prose. Invisible in rendered Markdown."
-    ),
-    "magic number": (
-        "A non-trivial numeric literal (not 0/1/2/10/100/-1) embedded "
-        "directly in formula or VBA code. Usually a candidate for "
-        "extraction into a named constant."
-    ),
-    "On Error Resume Next": (
-        "VBA directive that silently skips the next failing line. "
-        "Risky pattern: errors are suppressed, code keeps running with "
-        "potentially-bad state. Always reviewed in the audit."
-    ),
-    "pillar cell": (
-        "A cell with high fan-in (≥ 20 by default) — modifying it cascades "
-        "to many formulas. The audit's primary diagnostic for \"what "
-        "should I never accidentally change?\""
-    ),
-    "Sanitize mode": (
-        "Optional `--sanitize` flag that replaces every non-formula cell "
-        "value with `<redacted>` before any analysis. Formulas, VBA "
-        "structure, and counts are preserved. Designed for sharing the "
-        "audit without leaking the workbook's data."
-    ),
-    "smell": (
-        "A code pattern the audit flags as worth a second look. Not a bug — "
-        "a heuristic 'smelly' indicator borrowed from software engineering."
-    ),
-    "tier (1/1.5/2/3/4/5)": (
-        "Our product tiers — Tier 1 = this audit (free, zero-LLM); "
-        "Tier 1.5 = LLM-assisted comprehension (BYOA); Tier 2 = exec risk "
-        "report; Tier 3 = refactored Python prototype; etc."
-    ),
-    "Track A / Track B": (
-        "Two-track architecture for Tier 1 reports. Track A is fully "
-        "static (no LLM); Track B is BYOA — tool produces a dossier + "
-        "mega-prompt the user pastes into their own Copilot / Claude, "
-        "then pastes the response back."
-    ),
-    "veryHidden sheet": (
-        "Excel hides three states: visible / hidden / veryHidden. "
-        "veryHidden cannot be unhidden through the right-click menu — only "
-        "VBA can reveal it. Often used for internal config or audit-trail "
-        "data the user shouldn't touch."
-    ),
-    "workflow step": (
-        "One operational step a user performs — typically clicking a "
-        "button or triggering an event handler. Derived from xl/drawings "
-        "+ VBA static analysis, then topologically sorted by sheet write/"
-        "read dependency."
-    ),
-}
+_GLOSSARY_KEYS = (
+    "anomaly", "audit", "byoa", "column_block", "complexity_score",
+    "confidence", "vba_classes", "dead_suspected", "domain",
+    "duplicated_formulas", "fan_in", "formula_relay", "hermans_smells",
+    "incoming_outgoing", "llm_augment", "magic_number", "on_error",
+    "pillar", "sanitize", "smell", "tier", "track_a_b", "very_hidden",
+    "workflow_step",
+)
 
 
-def _section_glossary(report) -> list:
+def _glossary_term_def(slug: str, lang: str) -> tuple:
+    """Return (term, definition) for a glossary slug, parsing the catalog
+    `term||definition` value format."""
+    raw = t(f"glossary.{slug}", lang)
+    if "||" in raw:
+        term, defn = raw.split("||", 1)
+        return term.strip(), defn.strip()
+    return raw, ""
+
+
+def _section_glossary(report, lang: str = DEFAULT_LANG) -> list:
     """D8: Glossary — alphabetical plain-language definitions."""
     L: list = []
-    L.append("## Glossary")
+    L.append(f"## {t('glossary.heading', lang)}")
     L.append("")
-    L.append("_Plain-language definitions for terms used throughout this report. "
-             "Alphabetical._")
+    L.append(f"_{t('glossary.intro', lang)}_")
     L.append("")
-    for term in sorted(_GLOSSARY_TERMS.keys(), key=str.lower):
-        defn = _GLOSSARY_TERMS[term]
+    items: list = [_glossary_term_def(slug, lang) for slug in _GLOSSARY_KEYS]
+    items.sort(key=lambda kv: kv[0].lower())
+    for term, defn in items:
         L.append(f"- **{_md_escape(term)}** — {_md_escape(defn)}")
     L.append("")
     return L
 
 
-def _section_executive_summary_round3(report) -> list:
+def _section_executive_summary_round3(report, lang: str = DEFAULT_LANG) -> list:
     """Round-3 executive summary — 3-5 manager-readable headlines.
 
     Replaces the prior more verbose exec summary with a tightly-filtered
@@ -1592,84 +1813,95 @@ def _section_executive_summary_round3(report) -> list:
     c = report.complexity
     domain = getattr(report, "domain_hint", None)
 
-    L.append("## Executive Summary")
+    L.append(f"## {t('exec_summary.heading', lang)}")
     L.append("")
     # Headline: complexity + plain-language rendition
     if c.total >= 80:
-        complexity_tier = "top tier — substantial refactor effort"
+        complexity_tier = t("exec_summary.complexity_tier_top", lang)
     elif c.total >= 50:
-        complexity_tier = "moderately complex — meaningful refactor effort"
+        complexity_tier = t("exec_summary.complexity_tier_moderate", lang)
     elif c.total >= 20:
-        complexity_tier = "manageable — straightforward to read"
+        complexity_tier = t("exec_summary.complexity_tier_manageable", lang)
     else:
-        complexity_tier = "small / lightly-used"
-    L.append(f"- **Complexity score: {c.total} / 100** — {complexity_tier}.")
+        complexity_tier = t("exec_summary.complexity_tier_small", lang)
+    L.append("- " + t("exec_summary.complexity_line", lang,
+                      total=c.total, tier=complexity_tier))
 
     # Top pillar
     if report.pillars:
         p = report.pillars[0]
         if p.member_count > 1:
-            L.append(f"- **Most-referenced cell group**: `{p.location}` "
-                     f"({p.member_count} cells, fan-in {p.fan_in}). "
-                     f"Each cell drives {p.fan_in} calculations.")
+            L.append("- " + t("exec_summary.most_referenced_group", lang,
+                              location=p.location, member_count=p.member_count,
+                              fan_in=p.fan_in))
         else:
             value_phrase = ""
             if p.value:
-                value_phrase = f" (value `{p.value[:30]}`)"
-            L.append(f"- **Single most-impactful cell**: `{p.location}`{value_phrase} "
-                     f"feeds {p.fan_in} formulas across "
-                     f"{p.affected_sheet_count} sheet(s). Change it, change them all.")
+                value_phrase = t("exec_summary.value_phrase", lang, value=p.value[:30])
+            L.append("- " + t("exec_summary.single_most_impactful", lang,
+                              location=p.location, value_phrase=value_phrase,
+                              fan_in=p.fan_in,
+                              affected_sheet_count=p.affected_sheet_count))
 
     # Top smell or anomaly
     if report.anomalies:
         a = report.anomalies[0]
-        L.append(f"- **Top data-anomaly**: in a cluster of {a.cluster_size} "
-                 f"similar formulas, value `{a.outlier_value}` deviates from "
-                 f"the norm `{a.mode_value}` at `{a.outlier_locations[0]}` "
-                 f"(confidence: {a.confidence}).")
+        L.append("- " + t("exec_summary.top_anomaly", lang,
+                          cluster_size=a.cluster_size,
+                          outlier_value=a.outlier_value,
+                          mode_value=a.mode_value,
+                          outlier_location=a.outlier_locations[0],
+                          confidence=a.confidence))
     elif report.smells:
         top_smell = max(report.smells, key=lambda s: s.metric)
-        L.append(f"- **Top smell**: `{top_smell.smell_type}` at "
-                 f"`{top_smell.location}` (metric={top_smell.metric:g}, "
-                 f"severity={top_smell.severity}).")
+        L.append("- " + t("exec_summary.top_smell", lang,
+                          smell_type=top_smell.smell_type,
+                          location=top_smell.location,
+                          metric=f"{top_smell.metric:g}",
+                          severity=top_smell.severity))
 
     # Domain
     if domain is not None and domain.domain != "unknown":
         kw_str = ", ".join(domain.matched_keywords[:5])
-        L.append(f"- **Detected domain**: `{domain.domain}` "
-                 f"_(confidence: {domain.confidence}, matched: {kw_str}_).")
+        L.append("- " + t("exec_summary.detected_domain", lang,
+                          domain=domain.domain,
+                          confidence=domain.confidence,
+                          keywords=kw_str))
 
     # Workflow
     wf = (getattr(report, "workflow", None) or {})
     n_buttons = len(wf.get("buttons", []) or [])
     n_events = len(wf.get("event_handlers", []) or [])
     if n_buttons or n_events:
-        L.append(f"- **Operational entry points**: {n_buttons} button(s), "
-                 f"{n_events} event handler(s). See Workflow Guide for the walkthrough.")
+        L.append("- " + t("exec_summary.entry_points", lang,
+                          n_buttons=n_buttons, n_events=n_events))
     else:
-        L.append(f"- **No buttons or event handlers detected** — workbook is "
-                 f"formula-driven only. Users interact via cell entries directly.")
+        L.append("- " + t("exec_summary.no_entry_points", lang))
 
     # Risks
     r = report.risk_indicators
     risks_short = []
     if r.very_hidden_sheets:
-        risks_short.append(f"{len(r.very_hidden_sheets)} veryHidden sheet(s)")
+        risks_short.append(t("exec_summary.risk_very_hidden_short", lang,
+                             n=len(r.very_hidden_sheets)))
     if r.hidden_sheets:
-        risks_short.append(f"{len(r.hidden_sheets)} hidden")
+        risks_short.append(t("exec_summary.risk_hidden_short", lang,
+                             n=len(r.hidden_sheets)))
     if r.cells_with_errors:
-        risks_short.append(f"{len(r.cells_with_errors)} formula-error cell(s)")
+        risks_short.append(t("exec_summary.risk_errors_short", lang,
+                             n=len(r.cells_with_errors)))
     if r.external_workbook_references:
-        risks_short.append(f"{len(r.external_workbook_references)} external link(s)")
+        risks_short.append(t("exec_summary.risk_external_short", lang,
+                             n=len(r.external_workbook_references)))
     if risks_short:
-        L.append(f"- **Risk flags**: " + "; ".join(risks_short) + ".")
+        L.append("- " + t("exec_summary.risk_flags", lang,
+                          risks="; ".join(risks_short)))
 
     # Sub-score table (compact)
     L.append("")
-    L.append("**Complexity sub-scores:**")
+    L.append(f"**{t('exec_summary.subscores_heading', lang)}**")
     L.append("")
-    L.append("| Sub-score | Value | Bar |")
-    L.append("|---|---|---|")
+    L.extend(_md_table_header_lines("complexity.short_columns", lang))
     sub = c.sub_scores
     for key in sorted(c.rationale.keys()):
         val = getattr(sub, key)
@@ -1683,26 +1915,24 @@ def _section_executive_summary_round3(report) -> list:
 # wrappers to relabel anchors as 8.x).
 # ---------------------------------------------------------------------------
 
-def _section_appendix_intro(report) -> list:
+def _section_appendix_intro(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("## Reference Appendix")
+    L.append(f"## {t('appendix.heading', lang)}")
     L.append("")
-    L.append("_Full data tables and indices. Every catalog the audit produces "
-             "lives below — for technical readers verifying findings or following "
-             "up on a Top Impact entry._")
+    L.append(f"_{t('appendix.intro', lang)}_")
     L.append("")
     return L
 
 
 # VBA classification summary table (for D6 — replaces the unreadable diagram
 # with a class-level table at the top, then a bounded mini-diagram).
-def _section_vba_classification_summary(report) -> list:
+def _section_vba_classification_summary(report, lang: str = DEFAULT_LANG) -> list:
     L: list = []
-    L.append("### VBA classification overview")
+    L.append(f"### {t('vba.classification_overview', lang)}")
     L.append("")
     classifications = report.vba_classifications or []
     if not classifications:
-        L.append("_No VBA modules._")
+        L.append(f"_{t('vba.no_modules', lang)}_")
         L.append("")
         return L
     by_class: dict = defaultdict(list)
@@ -1711,8 +1941,7 @@ def _section_vba_classification_summary(report) -> list:
     # Build module -> LOC lookup
     loc_by_name = {vm.name: vm.line_count for vm in report.vba_modules}
 
-    L.append("| Type | Count | Total LOC | Sample modules |")
-    L.append("|---|---|---|---|")
+    L.extend(_md_table_header_lines("vba.classification_table_columns", lang))
     known_order = ["data-loader", "transformer", "report-writer",
                    "ui-handler", "dead-suspected", "mixed"]
     seen: set = set()
@@ -1724,7 +1953,7 @@ def _section_vba_classification_summary(report) -> list:
         total_loc = sum(loc_by_name.get(c.module_name, 0) for c in items)
         sample = ", ".join(f"`{c.module_name}`" for c in items[:3])
         if len(items) > 3:
-            sample += f" (+{len(items)-3} more)"
+            sample += t("common.more_suffix", lang, n=len(items) - 3)
         L.append(f"| `{cls}` | {len(items)} | {total_loc:,} | {sample} |")
     for cls, items in sorted(by_class.items()):
         if cls in seen:
@@ -1732,10 +1961,10 @@ def _section_vba_classification_summary(report) -> list:
         total_loc = sum(loc_by_name.get(c.module_name, 0) for c in items)
         sample = ", ".join(f"`{c.module_name}`" for c in items[:3])
         if len(items) > 3:
-            sample += f" (+{len(items)-3} more)"
+            sample += t("common.more_suffix", lang, n=len(items) - 3)
         L.append(f"| `{cls}` | {len(items)} | {total_loc:,} | {sample} |")
     L.append("")
-    L.append("**Classification mini-diagram (top 2 categories, ≤ 15 nodes):**")
+    L.append(f"**{t('vba.classification_mini_diagram_heading', lang)}**")
     L.append("")
     L.append("```mermaid")
     L.append(_build_vba_classification_mermaid(report))
@@ -1765,22 +1994,22 @@ _TOP_LEVEL_HEADERS_FOR_TOC = [
 ]
 
 
-def _exec_summary_lines(report) -> list:
+def _exec_summary_lines(report, lang: str = DEFAULT_LANG) -> list:
     """Build the executive summary block. Returns markdown lines."""
-    return _section_executive_summary_round3(report)
+    return _section_executive_summary_round3(report, lang)
 
 
-def render_markdown(report) -> str:
+def render_markdown(report, lang: str = DEFAULT_LANG) -> str:
     """Round-3 pyramid layout — selective narrative > exhaustive dump."""
-    return _assemble_markdown(report)
+    return _assemble_markdown(report, lang)
 
 
-def _section_pillar_impact_diagram_only(report) -> list:
+def _section_pillar_impact_diagram_only(report, lang: str = DEFAULT_LANG) -> list:
     """Standalone Pillar impact diagram (H3 under appendix)."""
     L: list = []
-    L.append(f"### Pillar impact diagram")
+    L.append(f"### {t('diagrams.pillar_impact_heading', lang)}")
     L.append("")
-    L.append(f"_Top-{_DIAG3_MAX_PILLARS} pillar cells and the sheets they cascade into._")
+    L.append(f"_{t('diagrams.pillar_impact_intro', lang, top_n=_DIAG3_MAX_PILLARS)}_")
     L.append("")
     L.append("```mermaid")
     L.append(_build_pillar_impact_mermaid(report))
@@ -1795,18 +2024,74 @@ def _domain_findings_present(report) -> bool:
     return bool(matches)
 
 
-def _assemble_markdown(report) -> str:
+def _section_appendix_pillars_full(report, lang: str = DEFAULT_LANG) -> list:
+    L: list = []
+    L.append(f"### {t('appendix.pillars_heading', lang)}")
+    L.append("")
+    if not report.pillars:
+        L.append(f"_{t('appendix.pillars_none_at_threshold', lang)}_")
+        L.append("")
+        return L
+    L.append(f"_{t('appendix.pillars_intro', lang)}_")
+    L.append("")
+    L.extend(_md_table_header_lines("pillar.table_columns", lang))
+    for i, p in enumerate(report.pillars, start=1):
+        sheets_str = ", ".join(f"`{s}`" for s in p.affected_sheets[:5])
+        if len(p.affected_sheets) > 5:
+            sheets_str += t("common.more_suffix", lang, n=len(p.affected_sheets) - 5)
+        narrative = _render_pillar_narrative(p, lang)
+        L.append(
+            f"| {i} | `{_md_escape(p.location)}` | {_format_pillar_value_cell(p, lang)} | "
+            f"{_format_pillar_label_cell(p, lang)} | {p.member_count} | {p.fan_in} | "
+            f"{sheets_str} | {p.pillar_kind} | {_md_escape(narrative)} |"
+        )
+    L.append("")
+    return L
+
+
+def _section_appendix_smells_full(report, lang: str = DEFAULT_LANG) -> list:
+    L: list = []
+    L.append(f"### {t('appendix.smells_heading', lang)}")
+    L.append("")
+    types_count = len({s.smell_type for s in report.smells})
+    L.append(f"_{t('appendix.smells_summary', lang, n=len(report.smells), types=types_count)}_")
+    L.append("")
+    by_type: dict = defaultdict(list)
+    for s in report.smells:
+        by_type[s.smell_type].append(s)
+    for st in SMELL_TYPES:
+        items = by_type.get(st, [])
+        L.append(f"#### {t('appendix.smells_subheading', lang, type=st, count=len(items))}")
+        L.append("")
+        if not items:
+            L.append(f"_{t('smells.no_findings_threshold', lang)}_")
+            L.append("")
+            continue
+        L.extend(_md_table_header_lines("smells.table_columns", lang))
+        for s in items[:20]:
+            L.append(
+                f"| `{_md_escape(s.location)}` | {s.metric:g} | {s.severity} | "
+                f"{s.confidence} | {_md_escape(s.evidence)} |"
+            )
+        if len(items) > 20:
+            L.append("")
+            L.append(f"_{t('smells.more_findings', lang, n=len(items) - 20)}_")
+        L.append("")
+    return L
+
+
+def _assemble_markdown(report, lang: str = DEFAULT_LANG) -> str:
     """Round-3 pyramid assembly.
 
     1. Cover (filename, audit version, sanitize banner)
     2. Executive Summary (manager-readable)
-    3. Workflow Guide (NEW)
-    4. Data Flow Story (NEW)
+    3. Workflow Guide
+    4. Data Flow Story
     5. Top Impact Findings (Top-N each)
-    6. VBA Module Walkthrough (NEW)
+    6. VBA Module Walkthrough
     7. Domain-Specific Findings (when domain detected)
     8. Reference Appendix (H3 sub-sections — full data)
-    9. Glossary (NEW)
+    9. Glossary
     10. Methodology
     """
     L: list = []
@@ -1814,20 +2099,27 @@ def _assemble_markdown(report) -> str:
     from . import __version__ as _pkg_version
     # 1. Cover
     headline_complexity = report.complexity.total
-    L.append(f"# Audit report — `{m.file_name}` (audit v{_pkg_version})")
+    L.append(
+        f"# {t('cover.title', lang)} — `{m.file_name}` "
+        f"({t('cover.audit_version', lang, version=_pkg_version)})"
+    )
     L.append("")
 
     if report.sanitized:
-        L.append("> 🔒 **SANITIZED MODE** — no cell values in this report. "
-                 "Formulas, structure, smells, and VBA source are preserved; "
-                 "every non-formula cell value has been replaced with `<redacted>`.")
+        L.append(f"> {t('cover.sanitized_banner', lang)}")
         L.append(">")
-    L.append(f"> Headline: complexity **{headline_complexity}/100**, "
-             f"**{len(report.pillars)}** pillar cell(s), "
-             f"**{len(report.smells)}** smell finding(s).")
+    # cover.headline includes "complexity {complexity}, ..." — we pass the
+    # bold-wrapped "**N/100**" so the markdown shows it bold.
+    headline_md = t(
+        "cover.headline", lang,
+        complexity=f"**{headline_complexity}/100**",
+        pillar_count=f"**{len(report.pillars)}**",
+        smell_count=f"**{len(report.smells)}**",
+    )
+    L.append(f"> {headline_md}")
     L.append(">")
-    L.append("> Tier 1 audit. Pure static analysis — no AI, no Excel, no macro execution.")
-    L.append("> Same input always produces the same output. Findings ranked, not interpreted.")
+    L.append(f"> {t('cover.subline_1', lang)}")
+    L.append(f"> {t('cover.subline_2', lang)}")
     L.append("")
 
     # Build TOC dynamically (skip Domain-Specific Findings if not detected)
@@ -1836,122 +2128,78 @@ def _assemble_markdown(report) -> str:
         toc_headers = [h for h in toc_headers if h != "Domain-Specific Findings"]
 
     # 2. Executive Summary
-    L.extend(_exec_summary_lines(report))
+    L.extend(_exec_summary_lines(report, lang))
 
-    # TOC (right after exec)
-    L.append("## Table of Contents")
+    # TOC (right after exec). The header IS translated, but we store the
+    # English anchors in the TOC links so the cross-link to per-section
+    # H2 (whose anchor we compute from the EN slug) still resolves. To keep
+    # the markdown link working, we use the EN-anchored slug — but display
+    # the translated header text.
+    L.append(f"## {t('exec_summary.toc_heading', lang)}")
     L.append("")
-    for header in toc_headers:
-        anchor = _slugify_anchor(header)
-        L.append(f"- [{header}](#{anchor})")
+    for header_en in toc_headers:
+        anchor = _slugify_anchor(header_en)
+        # Translate the section heading text via lookup map
+        header_display = _toc_header_display(header_en, lang)
+        L.append(f"- [{header_display}](#{anchor})")
     L.append("")
 
     # 3. Workflow Guide
-    L.extend(_section_workflow_guide(report))
+    L.extend(_section_workflow_guide(report, lang))
 
     # 4. Data Flow Story
-    L.extend(_section_data_flow_story(report))
+    L.extend(_section_data_flow_story(report, lang))
 
     # 5. Top Impact Findings
-    L.extend(_section_top_impact_findings(report))
+    L.extend(_section_top_impact_findings(report, lang))
 
     # 6. VBA Module Walkthrough
-    L.extend(_section_vba_walkthrough(report))
+    L.extend(_section_vba_walkthrough(report, lang))
 
     # 7. Domain-Specific Findings (only when present)
     if _domain_findings_present(report):
-        L.extend(_section_domain_findings(report))
+        L.extend(_section_domain_findings(report, lang))
 
     # 8. Reference Appendix (full data tables, H3-level)
-    L.extend(_section_appendix_intro(report))
+    L.extend(_section_appendix_intro(report, lang))
 
     # 8.1 Pillar table (full)
-    L.append("### 8.1 Full pillar table")
-    L.append("")
-    pillar_rows = _section_pillars(report, top_n=None, with_drilldown=True)
-    # _section_pillars emits its own ## H2 header; replace with the H3 we want.
-    # Cleaner: build full table here by extracting rows.
-    if not report.pillars:
-        L.append("_No cells reach the pillar threshold._")
-        L.append("")
-    else:
-        L.append("_Full deduped pillar list — see Top Impact §5 for the Top-5 view._")
-        L.append("")
-        L.append("| Rank | Cell / range | Value | Label | Members | Fan-in | Affected sheets | Kind | Narrative |")
-        L.append("|---|---|---|---|---|---|---|---|---|")
-        for i, p in enumerate(report.pillars, start=1):
-            sheets_str = ", ".join(f"`{s}`" for s in p.affected_sheets[:5])
-            if len(p.affected_sheets) > 5:
-                sheets_str += f" (+{len(p.affected_sheets) - 5} more)"
-            L.append(
-                f"| {i} | `{_md_escape(p.location)}` | {_format_pillar_value_cell(p)} | "
-                f"{_format_pillar_label_cell(p)} | {p.member_count} | {p.fan_in} | "
-                f"{sheets_str} | {p.pillar_kind} | {_md_escape(p.narrative)} |"
-            )
-        L.append("")
+    L.extend(_section_appendix_pillars_full(report, lang))
 
     # 8.2 Smell catalog (full)
-    L.append("### 8.2 Full smells catalog (Hermans 2015)")
-    L.append("")
-    L.append(f"_{len(report.smells)} smell finding(s) across "
-             f"{len({s.smell_type for s in report.smells})} smell type(s)._")
-    L.append("")
-    by_type: dict = defaultdict(list)
-    for s in report.smells:
-        by_type[s.smell_type].append(s)
-    for st in SMELL_TYPES:
-        items = by_type.get(st, [])
-        L.append(f"#### `{st}` — {len(items)} finding(s)")
-        L.append("")
-        if not items:
-            L.append("_No findings above threshold._")
-            L.append("")
-            continue
-        L.append("| Location | Metric | Severity | Confidence | Evidence |")
-        L.append("|---|---|---|---|---|")
-        for s in items[:20]:
-            L.append(
-                f"| `{_md_escape(s.location)}` | {s.metric:g} | {s.severity} | "
-                f"{s.confidence} | {_md_escape(s.evidence)} |"
-            )
-        if len(items) > 20:
-            L.append("")
-            L.append(f"_({len(items)-20} more findings of this type — see `audit.json`.)_")
-        L.append("")
+    L.extend(_section_appendix_smells_full(report, lang))
 
     # 8.3 Sheets table
-    L.append("### 8.3 Sheets")
+    L.append(f"### {t('appendix.sheets_heading', lang)}")
     L.append("")
-    L.append("| Sheet | State | Rows | Cols | Non-empty | Formula | Max ref | CF | DV |")
-    L.append("|---|---|---|---|---|---|---|---|---|")
+    L.extend(_md_table_header_lines("sheets.table_columns", lang))
+    dash = t("common.dash", lang)
     for s in report.sheets:
         L.append(
             f"| `{_md_escape(s.name)}` | {s.state} | {s.rows_used} | {s.cols_used} | "
-            f"{s.cells_nonempty} | {s.cells_formula} | {s.max_ref or '—'} | "
+            f"{s.cells_nonempty} | {s.cells_formula} | {s.max_ref or dash} | "
             f"{s.conditional_formatting_count} | {s.data_validation_count} |"
         )
     L.append("")
 
     # 8.4 Named ranges
-    L.append("### 8.4 Named ranges")
+    L.append(f"### {t('appendix.named_ranges_heading', lang)}")
     L.append("")
     if not report.named_ranges:
-        L.append("_No named ranges defined._")
+        L.append(f"_{t('named_ranges.none', lang)}_")
     else:
-        L.append("| Name | Scope | Reference |")
-        L.append("|---|---|---|")
+        L.extend(_md_table_header_lines("named_ranges.table_columns", lang))
         for nr in report.named_ranges:
             L.append(f"| `{_md_escape(nr.name)}` | `{_md_escape(nr.scope)}` | `{_md_escape(nr.ref)}` |")
     L.append("")
 
     # 8.5 Magic-number index
-    L.append("### 8.5 Magic-number index (top 20)")
+    L.append(f"### {t('appendix.magic_heading', lang)}")
     L.append("")
     if not report.magic_numbers:
-        L.append("_No non-trivial numeric literals found._")
+        L.append(f"_{t('magic_index.none', lang)}_")
     else:
-        L.append("| Value | Count | First location | Source | Sample context |")
-        L.append("|---|---|---|---|---|")
+        L.extend(_md_table_header_lines("magic_index.table_columns", lang))
         for mn in report.magic_numbers:
             L.append(
                 f"| `{_md_escape(mn.value)}` | {mn.occurrence_count} | "
@@ -1962,34 +2210,38 @@ def _assemble_markdown(report) -> str:
 
     # 8.6 Risk indicators (full)
     r = report.risk_indicators
-    L.append("### 8.6 Risk indicators")
+    L.append(f"### {t('appendix.risks_heading', lang)}")
     L.append("")
-    L.append("| Indicator | Value |")
-    L.append("|---|---|")
-    L.append(f"| Hidden sheets | {len(r.hidden_sheets)} (`{', '.join(r.hidden_sheets) if r.hidden_sheets else '—'}`) |")
-    L.append(f"| Very-hidden sheets | {len(r.very_hidden_sheets)} (`{', '.join(r.very_hidden_sheets) if r.very_hidden_sheets else '—'}`) |")
-    L.append(f"| Cross-sheet referencing formulas | {r.cross_sheet_reference_count} |")
-    L.append(f"| Cells with formula errors (cached) | {len(r.cells_with_errors)} |")
-    L.append(f"| External workbook reference patterns | {len(r.external_workbook_references)} |")
-    L.append(f"| Circular reference suspects | {len(r.circular_reference_suspects)} |")
-    L.append(f"| Parse errors logged | {len(r.parse_errors)} |")
+    L.extend(_md_table_header_lines("risks.table_columns", lang))
+    L.append(
+        f"| {t('risks.row_hidden', lang)} | {len(r.hidden_sheets)} "
+        f"(`{', '.join(r.hidden_sheets) if r.hidden_sheets else dash}`) |"
+    )
+    L.append(
+        f"| {t('risks.row_very_hidden', lang)} | {len(r.very_hidden_sheets)} "
+        f"(`{', '.join(r.very_hidden_sheets) if r.very_hidden_sheets else dash}`) |"
+    )
+    L.append(f"| {t('risks.row_cross_sheet', lang)} | {r.cross_sheet_reference_count} |")
+    L.append(f"| {t('risks.row_errors', lang)} | {len(r.cells_with_errors)} |")
+    L.append(f"| {t('risks.row_external', lang)} | {len(r.external_workbook_references)} |")
+    L.append(f"| {t('risks.row_circular', lang)} | {len(r.circular_reference_suspects)} |")
+    L.append(f"| {t('risks.row_parse', lang)} | {len(r.parse_errors)} |")
     L.append("")
     if r.cells_with_errors:
-        L.append("**Formula error cells (first 20):**")
+        L.append(f"**{t('risks.errors_heading', lang)}**")
         L.append("")
-        L.append("| Sheet | Ref | Error |")
-        L.append("|---|---|---|")
+        L.extend(_md_table_header_lines("risks.errors_table_columns", lang))
         for ec in r.cells_with_errors[:20]:
             L.append(f"| `{_md_escape(ec['sheet'])}` | `{ec['ref']}` | `{ec['error_token']}` |")
         L.append("")
     if r.external_workbook_references:
-        L.append("**External workbook references:**")
+        L.append(f"**{t('risks.external_heading', lang)}**")
         L.append("")
         for ext in r.external_workbook_references[:20]:
             L.append(f"- `{_md_escape(ext)}`")
         L.append("")
     if r.circular_reference_suspects:
-        L.append("**Circular reference suspects (first 20):**")
+        L.append(f"**{t('risks.circular_heading', lang)}**")
         L.append("")
         for cs in r.circular_reference_suspects[:20]:
             L.append(f"- `{_md_escape(cs)}`")
@@ -1997,12 +2249,11 @@ def _assemble_markdown(report) -> str:
 
     # 8.7 Complexity score breakdown
     c = report.complexity
-    L.append("### 8.7 Complexity score breakdown")
+    L.append(f"### {t('appendix.complexity_heading', lang)}")
     L.append("")
-    L.append(f"**Total: {c.total} / 100**")
+    L.append(f"**{t('complexity.total_label', lang, total=c.total)}**")
     L.append("")
-    L.append("| Sub-score | Value | Bar | Rationale |")
-    L.append("|---|---|---|---|")
+    L.extend(_md_table_header_lines("complexity.table_columns", lang))
     sub = c.sub_scores
     for key in sorted(c.rationale.keys()):
         val = getattr(sub, key)
@@ -2011,75 +2262,153 @@ def _assemble_markdown(report) -> str:
     L.append("")
 
     # 8.8 VBA classification + full table
-    L.extend(_section_vba_classification_summary(report))
-    # Full VBA modules table
-    L.append("#### VBA modules — full table")
+    L.append(f"### {t('appendix.vba_heading', lang)}")
     L.append("")
+    classifications = report.vba_classifications or []
+    if not classifications:
+        L.append(f"_{t('vba.no_modules', lang)}_")
+        L.append("")
+    else:
+        by_class: dict = defaultdict(list)
+        for cls_obj in classifications:
+            by_class[cls_obj.inferred_type].append(cls_obj)
+        loc_by_name = {vm.name: vm.line_count for vm in report.vba_modules}
+        L.extend(_md_table_header_lines("vba.classification_table_columns", lang))
+        known_order = ["data-loader", "transformer", "report-writer",
+                       "ui-handler", "dead-suspected", "mixed"]
+        seen: set = set()
+        for cls in known_order:
+            items = by_class.get(cls, [])
+            if not items:
+                continue
+            seen.add(cls)
+            total_loc = sum(loc_by_name.get(c.module_name, 0) for c in items)
+            sample = ", ".join(f"`{c.module_name}`" for c in items[:3])
+            if len(items) > 3:
+                sample += t("common.more_suffix", lang, n=len(items) - 3)
+            L.append(f"| `{cls}` | {len(items)} | {total_loc:,} | {sample} |")
+        for cls, items in sorted(by_class.items()):
+            if cls in seen:
+                continue
+            total_loc = sum(loc_by_name.get(c.module_name, 0) for c in items)
+            sample = ", ".join(f"`{c.module_name}`" for c in items[:3])
+            if len(items) > 3:
+                sample += t("common.more_suffix", lang, n=len(items) - 3)
+            L.append(f"| `{cls}` | {len(items)} | {total_loc:,} | {sample} |")
+        L.append("")
+        L.append(f"**{t('vba.classification_mini_diagram_heading', lang)}**")
+        L.append("")
+        L.append("```mermaid")
+        L.append(_build_vba_classification_mermaid(report))
+        L.append("```")
+        L.append("")
+    # Full VBA modules table
+    L.append(f"#### {t('vba.full_modules_table_heading', lang)}")
+    L.append("")
+    yes = t("common.yes", lang)
+    no = t("common.no", lang)
     if not report.vba_modules:
-        L.append("_No VBA modules found._")
+        L.append(f"_{t('vba.no_modules_simple', lang)}_")
     else:
         cls_by_name = {c.module_name: c for c in (report.vba_classifications or [])}
-        L.append("| Module | Type | LOC | #Sub | #Func | Inferred type | Confidence | Reads | Writes | Ext calls | OnErrorResumeNext |")
-        L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        L.extend(_md_table_header_lines("vba.modules_table_columns", lang))
         for vm in report.vba_modules:
             n_sub = sum(1 for sf in vm.sub_functions if sf.kind == "Sub")
             n_func = sum(1 for sf in vm.sub_functions if sf.kind == "Function")
             cls = cls_by_name.get(vm.name)
-            inferred = cls.inferred_type if cls else "—"
-            cls_conf = cls.confidence if cls else "—"
-            reads = ", ".join(f"`{s}`" for s in (cls.reads_sheets if cls else [])) or "—"
-            writes = ", ".join(f"`{s}`" for s in (cls.writes_sheets if cls else [])) or "—"
-            ext_call = ("yes" if (cls and cls.external_calls) else "no") if cls else "—"
+            inferred = cls.inferred_type if cls else dash
+            cls_conf = cls.confidence if cls else dash
+            reads = ", ".join(f"`{s}`" for s in (cls.reads_sheets if cls else [])) or dash
+            writes = ", ".join(f"`{s}`" for s in (cls.writes_sheets if cls else [])) or dash
+            ext_call = (yes if (cls and cls.external_calls) else no) if cls else dash
             L.append(
                 f"| `{_md_escape(vm.name)}` | {vm.type} | {vm.line_count} | "
                 f"{n_sub} | {n_func} | **{inferred}** | {cls_conf} | "
                 f"{_md_escape(reads)} | {_md_escape(writes)} | {ext_call} | "
-                f"{'yes' if vm.has_on_error_resume_next else 'no'} |"
+                f"{yes if vm.has_on_error_resume_next else no} |"
             )
     L.append("")
 
     # 8.9 Pillar impact diagram (kept as evidence)
-    L.extend(_section_pillar_impact_diagram_only(report))
+    L.append(f"### {t('appendix.diagram_heading', lang)}")
+    L.append("")
+    L.append(f"_{t('diagrams.pillar_impact_intro', lang, top_n=_DIAG3_MAX_PILLARS)}_")
+    L.append("")
+    L.append("```mermaid")
+    L.append(_build_pillar_impact_mermaid(report))
+    L.append("```")
+    L.append("")
 
     # 8.10 File metadata + basic stats
-    L.append("### 8.10 File metadata")
+    L.append(f"### {t('appendix.metadata_heading', lang)}")
     L.append("")
-    L.append("| Field | Value |")
-    L.append("|---|---|")
-    L.append(f"| File name | `{m.file_name}` |")
-    L.append(f"| File size | {m.file_size_bytes:,} bytes ({m.file_size_bytes/1024:.1f} KB) |")
-    L.append(f"| SHA-256 | `{m.sha256}` |")
+    L.extend(_md_table_header_lines("metadata.table_columns", lang))
+    L.append(f"| {t('metadata.row_filename', lang)} | `{m.file_name}` |")
+    L.append(
+        f"| {t('metadata.row_filesize', lang)} | "
+        + t("metadata.row_filesize_value", lang,
+            bytes_fmt=f"{m.file_size_bytes:,}", kb=f"{m.file_size_bytes/1024:.1f}")
+        + " |"
+    )
+    L.append(f"| {t('metadata.row_sha256', lang)} | `{m.sha256}` |")
     if report.sanitized:
-        L.append(f"| Sanitize mode | **active** (cell values redacted) |")
+        L.append(
+            f"| {t('metadata.row_sanitize', lang)} | "
+            f"{t('metadata.sanitize_value', lang)} |"
+        )
     L.append("")
 
     # 8.11 Basic statistics (the original table)
     b = report.basic_stats
-    L.append("### 8.11 Basic statistics")
+    L.append(f"### {t('appendix.basic_stats_heading', lang)}")
     L.append("")
-    L.append("| Metric | Value |")
-    L.append("|---|---|")
-    L.append(f"| Sheet count (total) | {b.sheet_count} |")
-    L.append(f"| Sheet count visible / hidden / veryHidden | "
-             f"{b.sheet_count_visible} / {b.sheet_count_hidden} / {b.sheet_count_very_hidden} |")
-    L.append(f"| Non-empty cells | {b.cell_count_nonempty:,} |")
-    L.append(f"| Formula cells | {b.cell_count_formula:,} |")
-    L.append(f"| Unique non-formula values | {b.cell_count_unique_values:,} |")
-    L.append(f"| Named ranges | {b.named_range_count} |")
-    L.append(f"| Conditional formatting rules | {b.conditional_formatting_count} |")
-    L.append(f"| Data validation rules | {b.data_validation_count} |")
-    L.append(f"| VBA modules | {b.vba_module_count} |")
-    L.append(f"| VBA total lines | {b.vba_total_lines:,} |")
-    L.append(f"| Cell-level parse errors (logged + skipped) | {b.parse_errors_count} |")
+    L.extend(_md_table_header_lines("basic_stats.table_columns", lang))
+    L.append(f"| {t('basic_stats.row_sheet_count', lang)} | {b.sheet_count} |")
+    L.append(
+        f"| {t('basic_stats.row_sheet_visibility', lang)} | "
+        f"{b.sheet_count_visible} / {b.sheet_count_hidden} / {b.sheet_count_very_hidden} |"
+    )
+    L.append(f"| {t('basic_stats.row_cells_nonempty', lang)} | {b.cell_count_nonempty:,} |")
+    L.append(f"| {t('basic_stats.row_cells_formula', lang)} | {b.cell_count_formula:,} |")
+    L.append(f"| {t('basic_stats.row_unique_values', lang)} | {b.cell_count_unique_values:,} |")
+    L.append(f"| {t('basic_stats.row_named_ranges', lang)} | {b.named_range_count} |")
+    L.append(f"| {t('basic_stats.row_cf', lang)} | {b.conditional_formatting_count} |")
+    L.append(f"| {t('basic_stats.row_dv', lang)} | {b.data_validation_count} |")
+    L.append(f"| {t('basic_stats.row_vba_modules', lang)} | {b.vba_module_count} |")
+    L.append(f"| {t('basic_stats.row_vba_lines', lang)} | {b.vba_total_lines:,} |")
+    L.append(f"| {t('basic_stats.row_parse_errors', lang)} | {b.parse_errors_count} |")
     L.append("")
 
     # 9. Glossary
-    L.extend(_section_glossary(report))
+    L.extend(_section_glossary(report, lang))
 
     # 10. Methodology
-    L.extend(_section_methodology(report))
+    L.extend(_section_methodology(report, lang))
 
     return "\n".join(L) + "\n"
+
+
+# Map of EN top-level header -> i18n heading key (for TOC display + HTML toc).
+_TOC_HEADER_KEY_MAP = {
+    "Executive Summary": "exec_summary.heading",
+    "Workflow Guide": "workflow.heading",
+    "Data Flow Story": "data_flow.heading",
+    "Top Impact Findings": "top_impact.heading",
+    "VBA Module Walkthrough": "vba.heading_walkthrough",
+    "Domain-Specific Findings": "domain_findings.heading",
+    "Reference Appendix": "appendix.heading",
+    "Glossary": "glossary.heading",
+    "Methodology": "methodology.heading",
+}
+
+
+def _toc_header_display(header_en: str, lang: str) -> str:
+    """Translate a TOC header from English to the target language using the
+    appropriate i18n heading key. Falls back to the English text."""
+    key = _TOC_HEADER_KEY_MAP.get(header_en)
+    if key is None:
+        return header_en
+    return t(key, lang)
 
 
 # ---------------------------------------------------------------------------
@@ -2185,8 +2514,18 @@ def _html_code(s: Any) -> str:
     return f"<code>{_h(s)}</code>"
 
 
-def _html_section_open(title: str) -> str:
-    anchor = _slugify_anchor(title)
+def _html_section_open(title: str, anchor_override: str = "") -> str:
+    """Build a `<section><h2>` opening tag.
+
+    `anchor_override`: when provided, use this instead of slugifying the
+    title. Used so a translated title (Chinese characters) still gets a
+    stable EN-derived anchor for the HTML id.
+    """
+    anchor = anchor_override or _slugify_anchor(title)
+    if not anchor:
+        # Fallback when title is non-ASCII and no override: derive a stable
+        # slug via simple hash so the section is still uniquely addressable.
+        anchor = "section-" + str(abs(hash(title)) % 10**8)
     return f'<section class="audit-section" id="{anchor}"><h2>{_h(title)}</h2>'
 
 
@@ -2194,15 +2533,18 @@ def _html_section_close() -> str:
     return "</section>"
 
 
-def _html_exec_summary(report) -> str:
+def _html_exec_summary(report, lang: str = DEFAULT_LANG) -> str:
     c = report.complexity
     domain = getattr(report, "domain_hint", None)
-    findings = _headline_findings(report)
+    findings = _headline_findings(report, lang)
 
     parts: list = []
     parts.append('<section class="audit-section exec-summary" id="executive-summary">')
-    parts.append('<h2>Executive Summary</h2>')
-    parts.append(f"<p><strong>Complexity</strong>: {c.total} / 100</p>")
+    parts.append(f'<h2>{_h(t("exec_summary.heading", lang))}</h2>')
+    parts.append(
+        f"<p><strong>{_h(t('exec_summary.complexity_label', lang))}</strong>: "
+        f"{c.total} / 100</p>"
+    )
 
     sub = c.sub_scores
     rows = []
@@ -2214,34 +2556,38 @@ def _html_exec_summary(report) -> str:
             _h(f"{val}/20"),
             bar_html,
         ])
-    parts.append(_html_table(["Sub-score", "Value", "Bar"], rows))
+    cols = split_pipe_columns(t("complexity.short_columns", lang))
+    parts.append(_html_table(cols, rows))
 
-    parts.append("<p><strong>Top findings:</strong></p>")
+    parts.append(f"<p><strong>{_h(t('exec_summary.top_findings_label', lang))}</strong></p>")
     if findings:
         cards: list = []
         for f in findings:
             cls = "callout-card"
-            if f.startswith("**Pillar"):
+            if (f.startswith("**Pillar")
+                    or f.startswith("**Systemrelevante")
+                    or f.startswith("**支柱")):
                 cls = "callout-card callout-pillar"
-            elif f.startswith("**Anomaly"):
+            elif (f.startswith("**Anomaly")
+                    or f.startswith("**Anomalie")
+                    or f.startswith("**异常")):
                 cls = "callout-card callout-anomaly"
             cards.append(f'<div class="{cls}">{_inline_md_to_html(f)}</div>')
         parts.append("".join(cards))
     else:
-        parts.append("<p><em>No salient findings.</em></p>")
+        parts.append(f"<p><em>{_h(t('exec_summary.no_findings', lang))}</em></p>")
 
     if domain is not None:
         if domain.domain == "unknown":
-            parts.append(
-                "<p><strong>Detected domain</strong>: <em>unknown</em> — domain "
-                "not auto-detected; analyze manually.</p>"
-            )
+            parts.append("<p>" + _inline_md_to_html(
+                t("exec_summary.unknown_domain", lang)) + "</p>")
         else:
             kw_str = ", ".join(domain.matched_keywords)
-            parts.append(
-                f"<p><strong>Detected domain</strong>: <code>{_h(domain.domain)}</code> "
-                f"<em>(confidence: {_h(domain.confidence)} — matched: {_h(kw_str)})</em></p>"
-            )
+            parts.append("<p>" + _inline_md_to_html(
+                t("exec_summary.detected_domain_html", lang,
+                  domain=domain.domain,
+                  confidence=domain.confidence,
+                  keywords=kw_str)) + "</p>")
     parts.append("</section>")
     return "".join(parts)
 
@@ -2603,64 +2949,63 @@ def _html_diagrams(report) -> str:
     return "".join(out)
 
 
-def _html_methodology(report) -> str:
-    out = [_html_section_open("Methodology")]
+def _html_methodology(report, lang: str = DEFAULT_LANG) -> str:
+    out = [_html_section_open(t("methodology.heading", lang),
+                              anchor_override="methodology")]
     libs = report.methodology["library_versions"]
-    out.append(f"<ul><li>Engine: <code>openpyxl</code> {_h(libs['openpyxl'])} "
-               f"(cells/structure), <code>oletools.olevba</code> {_h(libs['oletools'])} "
-               f"(VBA), <code>formulas</code> {_h(libs['formulas'])} (tokenizer only — "
-               "no evaluator).</li>")
+    out.append("<ul><li>" + _inline_md_to_html(t(
+        "methodology.engine", lang,
+        openpyxl=libs['openpyxl'], oletools=libs['oletools'],
+        formulas=libs['formulas'])) + "</li>")
     thr = report.methodology["smell_thresholds"]
-    out.append(
-        f"<li>Smell thresholds: multiple-references &ge; {_h(thr['multiple-references'])}; "
-        f"long-calculation-chain depth &ge; {_h(thr['long-calculation-chain'])}; "
-        f"conditional-complexity nesting &ge; {_h(thr['conditional-complexity'])}; "
-        f"multiple-operations &ge; {_h(thr['multiple-operations'])}; "
-        f"duplicated-formulas pattern frequency &ge; {_h(thr['duplicated-formulas'])}.</li>"
-    )
+    out.append("<li>" + _inline_md_to_html(t(
+        "methodology.smell_thresholds", lang,
+        mr=thr['multiple-references'],
+        lcc=thr['long-calculation-chain'],
+        cc=thr['conditional-complexity'],
+        mo=thr['multiple-operations'],
+        df=thr['duplicated-formulas'])).replace(
+        "≥", "&ge;") + "</li>")
     ld = report.methodology["logic_depth_thresholds"]
-    out.append(
-        f"<li>Logic-depth thresholds: pillar fan-in &ge; {_h(ld['pillar-fanin-min'])} "
-        f"(top {_h(ld['pillar-top-n'])} after dedupe); anomaly cluster size &ge; "
-        f"{_h(ld['anomaly-cluster-min-size'])}, outlier fraction &le; "
-        f"{_h(ld['anomaly-outlier-fraction'])}.</li>"
-    )
-    out.append("<li>Pillar dedupe: cells in the same column with identical fan-in and "
-               "identical affected-sheet set are collapsed into one column-block entry.</li>")
-    out.append("<li>VBA classifier categories: " +
-               ", ".join(_html_code(c) for c in report.methodology["vba_classifier_categories"]) +
-               ".</li>")
-    out.append("<li>Confidence semantics: <code>high</code> = exact / deterministic count; "
-               "<code>medium</code> = tokenizer-based with well-defined rules; "
-               "<code>low</code> = statistical inference or analysis skipped due to scale.</li>")
-    out.append("<li>Domain hint detector: pure keyword matching (case-insensitive, "
-               "word-boundary). No LLM, no inference.</li>")
-    out.append("<li>Trivial numbers excluded from magic-number index: " +
-               ", ".join(_html_code(n) for n in sorted(TRIVIAL_NUMBERS)) + ".</li>")
-    out.append("<li>Reliability contract: same input &rarr; byte-identical "
-               "<code>audit.md</code>, <code>audit.json</code>, and <code>audit.html</code>. "
-               "All outputs use sorted dict keys and lexicographic list ordering. "
-               "No timestamps. No CDN fetch at audit time.</li>")
+    out.append("<li>" + _inline_md_to_html(t(
+        "methodology.logic_depth", lang,
+        pfm=ld['pillar-fanin-min'], ptn=ld['pillar-top-n'],
+        acms=ld['anomaly-cluster-min-size'],
+        aof=ld['anomaly-outlier-fraction'])).replace(
+        "≥", "&ge;").replace("≤", "&le;") + "</li>")
+    out.append("<li>" + _inline_md_to_html(t(
+        "methodology.pillar_dedupe_short", lang)) + "</li>")
+    cats = ", ".join(f"`{c}`" for c in report.methodology["vba_classifier_categories"])
+    out.append("<li>" + _inline_md_to_html(t(
+        "methodology.vba_categories", lang, categories=cats)) + "</li>")
+    out.append("<li>" + _inline_md_to_html(
+        t("methodology.confidence_semantics", lang)) + "</li>")
+    out.append("<li>" + _inline_md_to_html(
+        t("methodology.domain_detector_short", lang)) + "</li>")
+    nums = ", ".join(f"`{n}`" for n in sorted(TRIVIAL_NUMBERS))
+    out.append("<li>" + _inline_md_to_html(
+        t("methodology.trivial_numbers", lang, numbers=nums)) + "</li>")
+    out.append("<li>" + _inline_md_to_html(
+        t("methodology.reliability", lang)).replace("→", "&rarr;") + "</li>")
     if report.sanitized:
-        out.append("<li><strong>Sanitize mode active</strong>: every non-formula cell value "
-                   "has been replaced with <code>&lt;redacted&gt;</code> before any analysis ran. "
-                   "Formulas, VBA source, smells, pillars, anomalies, and structural counts "
-                   "remain accurate. The SHA-256 above is of the original file.</li>")
+        out.append("<li>" + _inline_md_to_html(
+            t("methodology.sanitize_active", lang)) + "</li>")
     out.append("</ul>")
-    out.append("<hr><p><em>End of report.</em></p>")
+    out.append(f"<hr><p><em>{_h(t('methodology.end_of_report', lang))}</em></p>")
     out.append(_html_section_close())
     return "".join(out)
 
 
-def _html_toc(report) -> str:
+def _html_toc(report, lang: str = DEFAULT_LANG) -> str:
     """Round-3 TOC: only the top-level pyramid headers, in order."""
     headers = [h for h in _TOP_LEVEL_HEADERS_FOR_TOC]
     if not _domain_findings_present(report):
         headers = [h for h in headers if h != "Domain-Specific Findings"]
-    out: list = ['<nav class="toc audit-section" id="toc"><h2>Table of Contents</h2><ul>']
+    out: list = [f'<nav class="toc audit-section" id="toc"><h2>{_h(t("exec_summary.toc_heading", lang))}</h2><ul>']
     for header in headers:
         anchor = _slugify_anchor(header)
-        out.append(f'<li><a href="#{anchor}">{_h(header)}</a></li>')
+        display = _toc_header_display(header, lang)
+        out.append(f'<li><a href="#{anchor}">{_h(display)}</a></li>')
     out.append("</ul></nav>")
     return "".join(out)
 
@@ -2681,12 +3026,26 @@ def _md_lines_to_html(lines: list) -> str:
     out: list = []
     i = 0
     n = len(lines)
+    # Pre-build a reverse lookup so a translated H2 title can resolve back to
+    # the EN section anchor (so HTML <section id="..."> stays stable across
+    # languages and TOC links keep working).
+    _heading_to_en_slug = {}
+    for en_title, key in _TOC_HEADER_KEY_MAP.items():
+        en_slug = _slugify_anchor(en_title)
+        for lang_code in SUPPORTED_LANGS:
+            translated = t(key, lang_code)
+            _heading_to_en_slug[translated] = en_slug
+            _heading_to_en_slug[en_title] = en_slug
     while i < n:
         line = lines[i]
         # H2
         if line.startswith("## "):
             title = line[3:].strip()
-            anchor = _slugify_anchor(title)
+            # Prefer the EN-derived anchor for a known translated heading.
+            anchor = _heading_to_en_slug.get(title) or _slugify_anchor(title)
+            if not anchor:
+                # Fallback: stable slug from any non-empty title hash
+                anchor = "section-" + str(abs(hash(title)) % 10**8)
             out.append(f'<section class="audit-section" id="{anchor}"><h2>{_h(title)}</h2>')
             i += 1
             continue
@@ -2775,116 +3134,125 @@ def _md_lines_to_html(lines: list) -> str:
     return "".join(out)
 
 
-def _html_workflow_guide(report) -> str:
-    return _md_lines_to_html(_section_workflow_guide(report))
+def _html_workflow_guide(report, lang: str = DEFAULT_LANG) -> str:
+    return _md_lines_to_html(_section_workflow_guide(report, lang))
 
 
-def _html_data_flow_story(report) -> str:
-    return _md_lines_to_html(_section_data_flow_story(report))
+def _html_data_flow_story(report, lang: str = DEFAULT_LANG) -> str:
+    return _md_lines_to_html(_section_data_flow_story(report, lang))
 
 
-def _html_top_impact_findings(report) -> str:
-    return _md_lines_to_html(_section_top_impact_findings(report))
+def _html_top_impact_findings(report, lang: str = DEFAULT_LANG) -> str:
+    return _md_lines_to_html(_section_top_impact_findings(report, lang))
 
 
-def _html_vba_walkthrough(report) -> str:
-    return _md_lines_to_html(_section_vba_walkthrough(report))
+def _html_vba_walkthrough(report, lang: str = DEFAULT_LANG) -> str:
+    return _md_lines_to_html(_section_vba_walkthrough(report, lang))
 
 
-def _html_domain_findings(report) -> str:
-    return _md_lines_to_html(_section_domain_findings(report))
+def _html_domain_findings(report, lang: str = DEFAULT_LANG) -> str:
+    return _md_lines_to_html(_section_domain_findings(report, lang))
 
 
-def _html_glossary(report) -> str:
-    return _md_lines_to_html(_section_glossary(report))
+def _html_glossary(report, lang: str = DEFAULT_LANG) -> str:
+    return _md_lines_to_html(_section_glossary(report, lang))
 
 
-def _html_appendix(report) -> str:
+def _html_appendix(report, lang: str = DEFAULT_LANG) -> str:
     """Render the Reference Appendix using the existing tableized helpers
     (so the appendix retains rich-HTML tables — preferred over MD-derived)."""
     parts: list = []
-    parts.append('<section class="audit-section" id="reference-appendix"><h2>Reference Appendix</h2>')
-    parts.append("<p><em>Full data tables and indices. Every catalog the audit "
-                 "produces lives below — for technical readers verifying findings "
-                 "or following up on a Top Impact entry.</em></p>")
+    parts.append(f'<section class="audit-section" id="reference-appendix"><h2>{_h(t("appendix.heading", lang))}</h2>')
+    parts.append(f"<p><em>{_h(t('appendix.intro', lang))}</em></p>")
     # 8.1 Pillar table (full) — reuse _html_pillars but rename heading
-    parts.append("<h3>8.1 Full pillar table</h3>")
-    parts.append(_html_pillars_table_only(report))
+    parts.append(f"<h3>{_h(t('appendix.pillars_heading', lang))}</h3>")
+    parts.append(_html_pillars_table_only(report, lang))
     # 8.2 Smells catalog
-    parts.append("<h3>8.2 Full smells catalog (Hermans 2015)</h3>")
-    parts.append(_html_smells_inner(report))
+    parts.append(f"<h3>{_h(t('appendix.smells_heading', lang))}</h3>")
+    parts.append(_html_smells_inner(report, lang))
     # 8.3 Sheets
-    parts.append("<h3>8.3 Sheets</h3>")
-    parts.append(_html_sheets_inner(report))
+    parts.append(f"<h3>{_h(t('appendix.sheets_heading', lang))}</h3>")
+    parts.append(_html_sheets_inner(report, lang))
     # 8.4 Named ranges
-    parts.append("<h3>8.4 Named ranges</h3>")
-    parts.append(_html_named_ranges_inner(report))
+    parts.append(f"<h3>{_h(t('appendix.named_ranges_heading', lang))}</h3>")
+    parts.append(_html_named_ranges_inner(report, lang))
     # 8.5 Magic-number index
-    parts.append("<h3>8.5 Magic-number index (top 20)</h3>")
-    parts.append(_html_magic_index_inner(report))
+    parts.append(f"<h3>{_h(t('appendix.magic_heading', lang))}</h3>")
+    parts.append(_html_magic_index_inner(report, lang))
     # 8.6 Risk indicators
-    parts.append("<h3>8.6 Risk indicators</h3>")
-    parts.append(_html_risks_inner(report))
+    parts.append(f"<h3>{_h(t('appendix.risks_heading', lang))}</h3>")
+    parts.append(_html_risks_inner(report, lang))
     # 8.7 Complexity breakdown
-    parts.append("<h3>8.7 Complexity score breakdown</h3>")
-    parts.append(_html_complexity_inner(report))
+    parts.append(f"<h3>{_h(t('appendix.complexity_heading', lang))}</h3>")
+    parts.append(_html_complexity_inner(report, lang))
     # 8.8 VBA classification + table
-    parts.append("<h3>8.8 VBA classification overview</h3>")
-    parts.append(_html_vba_summary_inner(report))
-    parts.append("<h4>VBA modules — full table</h4>")
-    parts.append(_html_vba_inner(report))
+    parts.append(f"<h3>8.8 {_h(t('vba.classification_overview', lang))}</h3>")
+    parts.append(_html_vba_summary_inner(report, lang))
+    parts.append(f"<h4>{_h(t('vba.full_modules_table_heading', lang))}</h4>")
+    parts.append(_html_vba_inner(report, lang))
     # 8.9 Pillar impact diagram
-    parts.append("<h3>8.9 Pillar impact diagram</h3>")
-    parts.append(f"<p><em>Top-{_DIAG3_MAX_PILLARS} pillar cells and the sheets they cascade into.</em></p>")
+    parts.append(f"<h3>8.9 {_h(t('diagrams.pillar_impact_heading', lang))}</h3>")
+    parts.append(f"<p><em>{_h(t('diagrams.pillar_impact_intro', lang, top_n=_DIAG3_MAX_PILLARS))}</em></p>")
     parts.append(f'<pre class="mermaid">{_h(_build_pillar_impact_mermaid(report))}</pre>')
     # 8.10 File metadata
-    parts.append("<h3>8.10 File metadata</h3>")
-    parts.append(_html_file_metadata_inner(report))
+    parts.append(f"<h3>{_h(t('appendix.metadata_heading', lang))}</h3>")
+    parts.append(_html_file_metadata_inner(report, lang))
     # 8.11 Basic statistics
-    parts.append("<h3>8.11 Basic statistics</h3>")
-    parts.append(_html_basic_stats_inner(report))
+    parts.append(f"<h3>{_h(t('appendix.basic_stats_heading', lang))}</h3>")
+    parts.append(_html_basic_stats_inner(report, lang))
     parts.append("</section>")
     return "".join(parts)
 
 
 # Inner table helpers — strip the section wrapper so the appendix can place
 # them under H3 sub-headers rather than separate H2 sections.
-def _html_pillars_table_only(report) -> str:
+def _html_pillars_table_only(report, lang: str = DEFAULT_LANG) -> str:
     if not report.pillars:
         thr = report.methodology["logic_depth_thresholds"]["pillar-fanin-min"]
-        return f"<p><em>No cells reach the pillar threshold (fan-in &ge; {_h(thr)}).</em></p>"
+        # The original used "fan-in &ge; N" — translate via the markdown key
+        # then escape to entity form.
+        msg = t("pillar.none_at_threshold", lang, threshold=thr).replace("≥", "&ge;")
+        return f"<p><em>{msg}</em></p>"
     rows = []
     for i, p in enumerate(report.pillars, start=1):
         sheets_str = ", ".join(_html_code(s) for s in p.affected_sheets[:5])
         if len(p.affected_sheets) > 5:
-            sheets_str += f" (+{len(p.affected_sheets) - 5} more)"
+            sheets_str += t("common.more_suffix", lang, n=len(p.affected_sheets) - 5)
         # Value cell HTML
         v = (getattr(p, "value", "") or "").strip()
-        val_html = "<em>(empty)</em>" if not v else f"<code>{_h(v[:30])}</code>"
-        # Label cell HTML
+        val_html = (f"<em>{_h(t('pillar.value_empty', lang))}</em>"
+                    if not v else f"<code>{_h(v[:30])}</code>")
+        # Label cell HTML — same labels as the markdown row, prefixed via i18n
         label_parts = []
         if getattr(p, "named_range", ""):
-            label_parts.append(f"named range <code>{_h(p.named_range)}</code>")
+            label_parts.append(
+                f"{_h(t('pillar.label_named_range_prefix', lang))} "
+                f"<code>{_h(p.named_range)}</code>"
+            )
         if getattr(p, "row_header", ""):
-            label_parts.append(f"row label <code>{_h(p.row_header[:25])}</code>")
+            label_parts.append(
+                f"{_h(t('pillar.label_row_prefix', lang))} "
+                f"<code>{_h(p.row_header[:25])}</code>"
+            )
         if getattr(p, "col_header", "") and p.col_header != getattr(p, "row_header", ""):
-            label_parts.append(f"col header <code>{_h(p.col_header[:25])}</code>")
-        label_html = "; ".join(label_parts) if label_parts else "—"
+            label_parts.append(
+                f"{_h(t('pillar.label_col_prefix', lang))} "
+                f"<code>{_h(p.col_header[:25])}</code>"
+            )
+        label_html = "; ".join(label_parts) if label_parts else _h(t("common.dash", lang))
+        narrative = _render_pillar_narrative(p, lang)
         rows.append([
             _h(i), _html_code(p.location), val_html, label_html,
             _h(p.member_count), _h(p.fan_in),
-            sheets_str, _h(p.pillar_kind), _h(p.narrative),
+            sheets_str, _h(p.pillar_kind), _h(narrative),
         ])
-    return _html_table(
-        ["Rank", "Cell / range", "Value", "Label", "Members", "Fan-in",
-         "Affected sheets", "Kind", "Narrative"],
-        rows,
-    )
+    cols = split_pipe_columns(t("pillar.table_columns", lang))
+    return _html_table(cols, rows)
 
 
-def _html_smells_inner(report) -> str:
-    out = [f"<p><em>{_h(len(report.smells))} smell finding(s) across "
-           f"{_h(len({s.smell_type for s in report.smells}))} smell type(s).</em></p>"]
+def _html_smells_inner(report, lang: str = DEFAULT_LANG) -> str:
+    types_count = len({s.smell_type for s in report.smells})
+    out = [f"<p><em>{_h(t('appendix.smells_summary', lang, n=len(report.smells), types=types_count))}</em></p>"]
     by_type: dict = defaultdict(list)
     for s in report.smells:
         by_type[s.smell_type].append(s)
@@ -2892,7 +3260,7 @@ def _html_smells_inner(report) -> str:
         items = by_type.get(st, [])
         out.append(f"<h4><code>{_h(st)}</code> &mdash; {_h(len(items))} finding(s)</h4>")
         if not items:
-            out.append("<p><em>No findings above threshold.</em></p>")
+            out.append(f"<p><em>{_h(t('smells.no_findings_threshold', lang))}</em></p>")
             continue
         rows = []
         for s in items[:20]:
@@ -2900,42 +3268,42 @@ def _html_smells_inner(report) -> str:
                 _html_code(s.location), _h(f"{s.metric:g}"),
                 _h(s.severity), _h(s.confidence), _h(s.evidence),
             ])
-        out.append(_html_table(
-            ["Location", "Metric", "Severity", "Confidence", "Evidence"], rows))
+        cols = split_pipe_columns(t("smells.table_columns", lang))
+        out.append(_html_table(cols, rows))
         if len(items) > 20:
-            out.append(f"<p><em>({len(items)-20} more findings of this type — see "
-                       "<code>audit.json</code>.)</em></p>")
+            # Template contains backtick markdown — render it inline
+            out.append(f"<p><em>{_inline_md_to_html(t('smells.more_findings', lang, n=len(items) - 20))}</em></p>")
     return "".join(out)
 
 
-def _html_sheets_inner(report) -> str:
+def _html_sheets_inner(report, lang: str = DEFAULT_LANG) -> str:
     rows = []
+    dash = t("common.dash", lang)
     for s in report.sheets:
         rows.append([
             _html_code(s.name), _h(s.state), _h(s.rows_used), _h(s.cols_used),
             _h(s.cells_nonempty), _h(s.cells_formula),
-            _h(s.max_ref or "—"),
+            _h(s.max_ref or dash),
             _h(s.conditional_formatting_count), _h(s.data_validation_count),
         ])
-    return _html_table(
-        ["Sheet", "State", "Rows", "Cols", "Non-empty", "Formula", "Max ref", "CF", "DV"],
-        rows,
-    )
+    cols = split_pipe_columns(t("sheets.table_columns", lang))
+    return _html_table(cols, rows)
 
 
-def _html_named_ranges_inner(report) -> str:
+def _html_named_ranges_inner(report, lang: str = DEFAULT_LANG) -> str:
     if not report.named_ranges:
-        return "<p><em>No named ranges defined.</em></p>"
+        return f"<p><em>{_h(t('named_ranges.none', lang))}</em></p>"
     rows = [
         [_html_code(nr.name), _html_code(nr.scope), _html_code(nr.ref)]
         for nr in report.named_ranges
     ]
-    return _html_table(["Name", "Scope", "Reference"], rows)
+    cols = split_pipe_columns(t("named_ranges.table_columns", lang))
+    return _html_table(cols, rows)
 
 
-def _html_magic_index_inner(report) -> str:
+def _html_magic_index_inner(report, lang: str = DEFAULT_LANG) -> str:
     if not report.magic_numbers:
-        return "<p><em>No non-trivial numeric literals found.</em></p>"
+        return f"<p><em>{_h(t('magic_index.none', lang))}</em></p>"
     rows = [
         [
             _html_code(mn.value), _h(mn.occurrence_count),
@@ -2944,46 +3312,53 @@ def _html_magic_index_inner(report) -> str:
         ]
         for mn in report.magic_numbers
     ]
-    return _html_table(
-        ["Value", "Count", "First location", "Source", "Sample context"], rows)
+    cols = split_pipe_columns(t("magic_index.table_columns", lang))
+    return _html_table(cols, rows)
 
 
-def _html_risks_inner(report) -> str:
+def _html_risks_inner(report, lang: str = DEFAULT_LANG) -> str:
     out: list = []
     r = report.risk_indicators
+    dash = t("common.dash", lang)
     rows = [
-        ["Hidden sheets",
-         _h(f"{len(r.hidden_sheets)} ({', '.join(r.hidden_sheets) if r.hidden_sheets else '—'})")],
-        ["Very-hidden sheets",
-         _h(f"{len(r.very_hidden_sheets)} ({', '.join(r.very_hidden_sheets) if r.very_hidden_sheets else '—'})")],
-        ["Cross-sheet referencing formulas", _h(r.cross_sheet_reference_count)],
-        ["Cells with formula errors (cached)", _h(len(r.cells_with_errors))],
-        ["External workbook reference patterns", _h(len(r.external_workbook_references))],
-        ["Circular reference suspects", _h(len(r.circular_reference_suspects))],
-        ["Parse errors logged", _h(len(r.parse_errors))],
+        [t("risks.row_hidden", lang),
+         _h(f"{len(r.hidden_sheets)} ({', '.join(r.hidden_sheets) if r.hidden_sheets else dash})")],
+        [t("risks.row_very_hidden", lang),
+         _h(f"{len(r.very_hidden_sheets)} ({', '.join(r.very_hidden_sheets) if r.very_hidden_sheets else dash})")],
+        [t("risks.row_cross_sheet", lang), _h(r.cross_sheet_reference_count)],
+        [t("risks.row_errors", lang), _h(len(r.cells_with_errors))],
+        [t("risks.row_external", lang), _h(len(r.external_workbook_references))],
+        [t("risks.row_circular", lang), _h(len(r.circular_reference_suspects))],
+        [t("risks.row_parse", lang), _h(len(r.parse_errors))],
     ]
-    out.append(_html_table(["Indicator", "Value"], rows))
+    cols = split_pipe_columns(t("risks.table_columns", lang))
+    out.append(_html_table(cols, rows))
     if r.cells_with_errors:
-        out.append("<h4>Formula error cells (first 20)</h4>")
+        # The original used "Formula error cells (first 20)" without colon for h4
+        eh = t("risks.errors_heading", lang).rstrip(":")
+        out.append(f"<h4>{_h(eh)}</h4>")
         rows = [
             [_html_code(ec["sheet"]), _html_code(ec["ref"]), _html_code(ec["error_token"])]
             for ec in r.cells_with_errors[:20]
         ]
-        out.append(_html_table(["Sheet", "Ref", "Error"], rows))
+        ecols = split_pipe_columns(t("risks.errors_table_columns", lang))
+        out.append(_html_table(ecols, rows))
     if r.external_workbook_references:
-        out.append("<h4>External workbook references</h4><ul>")
+        eh = t("risks.external_heading", lang).rstrip(":")
+        out.append(f"<h4>{_h(eh)}</h4><ul>")
         for ext in r.external_workbook_references[:20]:
             out.append(f"<li>{_html_code(ext)}</li>")
         out.append("</ul>")
     if r.circular_reference_suspects:
-        out.append("<h4>Circular reference suspects (first 20)</h4><ul>")
+        ch = t("risks.circular_heading", lang).rstrip(":")
+        out.append(f"<h4>{_h(ch)}</h4><ul>")
         for cs in r.circular_reference_suspects[:20]:
             out.append(f"<li>{_html_code(cs)}</li>")
         out.append("</ul>")
     return "".join(out)
 
 
-def _html_complexity_inner(report) -> str:
+def _html_complexity_inner(report, lang: str = DEFAULT_LANG) -> str:
     c = report.complexity
     sub = c.sub_scores
     rows = []
@@ -2995,15 +3370,17 @@ def _html_complexity_inner(report) -> str:
             f'<span class="bar">{_h(_sub_score_bar(val))}</span>',
             _h(c.rationale[key]),
         ])
-    return (f"<p><strong>Total</strong>: {_h(c.total)} / 100</p>"
-            + _html_table(["Sub-score", "Value", "Bar", "Rationale"], rows))
+    cols = split_pipe_columns(t("complexity.table_columns", lang))
+    return (f"<p><strong>{_h(t('complexity.total_word', lang))}</strong>: "
+            f"{_h(c.total)} / 100</p>"
+            + _html_table(cols, rows))
 
 
-def _html_vba_summary_inner(report) -> str:
+def _html_vba_summary_inner(report, lang: str = DEFAULT_LANG) -> str:
     """Render VBA classification summary + the bounded mermaid diagram."""
     classifications = report.vba_classifications or []
     if not classifications:
-        return "<p><em>No VBA modules.</em></p>"
+        return f"<p><em>{_h(t('vba.no_modules', lang))}</em></p>"
     by_class: dict = defaultdict(list)
     for c in classifications:
         by_class[c.inferred_type].append(c)
@@ -3020,7 +3397,7 @@ def _html_vba_summary_inner(report) -> str:
         total_loc = sum(loc_by_name.get(c.module_name, 0) for c in items)
         sample = ", ".join(_html_code(c.module_name) for c in items[:3])
         if len(items) > 3:
-            sample += f" (+{len(items)-3} more)"
+            sample += t("common.more_suffix", lang, n=len(items) - 3)
         rows.append([_html_code(cls), _h(len(items)), _h(f"{total_loc:,}"), sample])
     for cls, items in sorted(by_class.items()):
         if cls in seen:
@@ -3028,84 +3405,96 @@ def _html_vba_summary_inner(report) -> str:
         total_loc = sum(loc_by_name.get(c.module_name, 0) for c in items)
         sample = ", ".join(_html_code(c.module_name) for c in items[:3])
         if len(items) > 3:
-            sample += f" (+{len(items)-3} more)"
+            sample += t("common.more_suffix", lang, n=len(items) - 3)
         rows.append([_html_code(cls), _h(len(items)), _h(f"{total_loc:,}"), sample])
-    out = [_html_table(["Type", "Count", "Total LOC", "Sample modules"], rows)]
-    out.append("<h4>Classification mini-diagram (top 2 categories, &le; 15 nodes)</h4>")
+    cols = split_pipe_columns(t("vba.classification_table_columns", lang))
+    out = [_html_table(cols, rows)]
+    h_text = t("vba.classification_mini_diagram_heading", lang).rstrip(":").replace(
+        "≤", "&le;")
+    out.append(f"<h4>{h_text}</h4>")
     out.append(f'<pre class="mermaid">{_h(_build_vba_classification_mermaid(report))}</pre>')
     return "".join(out)
 
 
-def _html_vba_inner(report) -> str:
+def _html_vba_inner(report, lang: str = DEFAULT_LANG) -> str:
     if not report.vba_modules:
-        return "<p><em>No VBA modules found.</em></p>"
+        return f"<p><em>{_h(t('vba.no_modules_simple', lang))}</em></p>"
     cls_by_name = {c.module_name: c for c in (report.vba_classifications or [])}
     rows = []
+    dash = t("common.dash", lang)
+    yes = t("common.yes", lang)
+    no = t("common.no", lang)
     for vm in report.vba_modules:
         n_sub = sum(1 for sf in vm.sub_functions if sf.kind == "Sub")
         n_func = sum(1 for sf in vm.sub_functions if sf.kind == "Function")
         cls = cls_by_name.get(vm.name)
-        inferred = cls.inferred_type if cls else "—"
-        cls_conf = cls.confidence if cls else "—"
-        reads = ", ".join(_html_code(s) for s in (cls.reads_sheets if cls else [])) or "—"
-        writes = ", ".join(_html_code(s) for s in (cls.writes_sheets if cls else [])) or "—"
-        ext_call = ("yes" if (cls and cls.external_calls) else "no") if cls else "—"
+        inferred = cls.inferred_type if cls else dash
+        cls_conf = cls.confidence if cls else dash
+        reads = ", ".join(_html_code(s) for s in (cls.reads_sheets if cls else [])) or dash
+        writes = ", ".join(_html_code(s) for s in (cls.writes_sheets if cls else [])) or dash
+        ext_call = (yes if (cls and cls.external_calls) else no) if cls else dash
         rows.append([
             _html_code(vm.name), _h(vm.type), _h(vm.line_count),
             _h(n_sub), _h(n_func),
             f"<strong>{_h(inferred)}</strong>",
             _h(cls_conf), reads, writes, _h(ext_call),
-            _h("yes" if vm.has_on_error_resume_next else "no"),
+            _h(yes if vm.has_on_error_resume_next else no),
         ])
-    return _html_table(
-        ["Module", "Type", "LOC", "#Sub", "#Func", "Inferred type",
-         "Confidence", "Reads", "Writes", "Ext calls", "OnErrorResumeNext"],
-        rows,
-    )
+    cols = split_pipe_columns(t("vba.modules_table_columns", lang))
+    return _html_table(cols, rows)
 
 
-def _html_file_metadata_inner(report) -> str:
+def _html_file_metadata_inner(report, lang: str = DEFAULT_LANG) -> str:
     m = report.meta
     rows = [
-        ["File name", _html_code(m.file_name)],
-        ["File size", _h(f"{m.file_size_bytes:,} bytes ({m.file_size_bytes/1024:.1f} KB)")],
-        ["SHA-256", _html_code(m.sha256)],
+        [t("metadata.row_filename", lang), _html_code(m.file_name)],
+        [t("metadata.row_filesize", lang),
+         _h(t("metadata.row_filesize_value", lang,
+              bytes_fmt=f"{m.file_size_bytes:,}",
+              kb=f"{m.file_size_bytes/1024:.1f}"))],
+        [t("metadata.row_sha256", lang), _html_code(m.sha256)],
     ]
     if report.sanitized:
-        rows.append(["Sanitize mode", "<strong>active</strong> (cell values redacted)"])
-    return _html_table(["Field", "Value"], rows)
+        # Use the same rendered phrasing as MD; convert **active** to <strong>
+        rows.append([t("metadata.row_sanitize", lang),
+                     _inline_md_to_html(t("metadata.sanitize_value", lang))])
+    cols = split_pipe_columns(t("metadata.table_columns", lang))
+    return _html_table(cols, rows)
 
 
-def _html_basic_stats_inner(report) -> str:
+def _html_basic_stats_inner(report, lang: str = DEFAULT_LANG) -> str:
     b = report.basic_stats
     rows = [
-        ["Sheet count (total)", _h(b.sheet_count)],
-        ["Sheet count visible / hidden / veryHidden",
+        [t("basic_stats.row_sheet_count", lang), _h(b.sheet_count)],
+        [t("basic_stats.row_sheet_visibility", lang),
          _h(f"{b.sheet_count_visible} / {b.sheet_count_hidden} / {b.sheet_count_very_hidden}")],
-        ["Non-empty cells", _h(f"{b.cell_count_nonempty:,}")],
-        ["Formula cells", _h(f"{b.cell_count_formula:,}")],
-        ["Unique non-formula values", _h(f"{b.cell_count_unique_values:,}")],
-        ["Named ranges", _h(b.named_range_count)],
-        ["Conditional formatting rules", _h(b.conditional_formatting_count)],
-        ["Data validation rules", _h(b.data_validation_count)],
-        ["VBA modules", _h(b.vba_module_count)],
-        ["VBA total lines", _h(f"{b.vba_total_lines:,}")],
-        ["Cell-level parse errors (logged + skipped)", _h(b.parse_errors_count)],
+        [t("basic_stats.row_cells_nonempty", lang), _h(f"{b.cell_count_nonempty:,}")],
+        [t("basic_stats.row_cells_formula", lang), _h(f"{b.cell_count_formula:,}")],
+        [t("basic_stats.row_unique_values", lang), _h(f"{b.cell_count_unique_values:,}")],
+        [t("basic_stats.row_named_ranges", lang), _h(b.named_range_count)],
+        [t("basic_stats.row_cf", lang), _h(b.conditional_formatting_count)],
+        [t("basic_stats.row_dv", lang), _h(b.data_validation_count)],
+        [t("basic_stats.row_vba_modules", lang), _h(b.vba_module_count)],
+        [t("basic_stats.row_vba_lines", lang), _h(f"{b.vba_total_lines:,}")],
+        [t("basic_stats.row_parse_errors", lang), _h(b.parse_errors_count)],
     ]
-    return _html_table(["Metric", "Value"], rows)
+    cols = split_pipe_columns(t("basic_stats.table_columns", lang))
+    return _html_table(cols, rows)
 
 
 _MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
 
 
-def render_html(report, mermaid_inline: bool = False, mermaid_inline_source: str = "") -> str:
+def render_html(report, mermaid_inline: bool = False,
+                mermaid_inline_source: str = "",
+                lang: str = DEFAULT_LANG) -> str:
     """Render the audit as a styled HTML page (round-3 pyramid layout)."""
     from . import __version__ as _pkg_version
     m = report.meta
 
     parts: list = []
     parts.append("<!DOCTYPE html>")
-    parts.append('<html lang="en"><head>')
+    parts.append(f'<html lang="{_h(lang)}"><head>')
     parts.append('<meta charset="utf-8">')
     parts.append('<meta name="viewport" content="width=device-width,initial-scale=1">')
     parts.append(f"<title>Audit: {_h(m.file_name)}</title>")
@@ -3120,35 +3509,43 @@ def render_html(report, mermaid_inline: bool = False, mermaid_inline_source: str
                  "</script>")
     parts.append("</head><body>")
 
-    parts.append(f"<h1>Audit report &mdash; <code>{_h(m.file_name)}</code> "
-                 f"(audit v{_h(_pkg_version)})</h1>")
+    parts.append(f"<h1>{_h(t('cover.title', lang))} &mdash; <code>{_h(m.file_name)}</code> "
+                 f"({_h(t('cover.audit_version', lang, version=_pkg_version))})</h1>")
 
     if report.sanitized:
-        parts.append('<div class="banner-sanitize">&#128274; SANITIZED MODE — no cell '
-                     "values in this report. Formulas, structure, smells, and VBA source "
-                     "are preserved; every non-formula cell value has been replaced with "
-                     "<code>&lt;redacted&gt;</code>.</div>")
+        # Reuse the markdown banner template; convert ` ` and `**` markers
+        # to HTML.
+        banner_md = t("cover.sanitized_banner", lang)
+        # Strip leading "🔒 " emoji for HTML version (we use entity)
+        banner_inner = banner_md
+        if banner_inner.startswith("🔒 "):
+            banner_inner = banner_inner[len("🔒 "):]
+        banner_html = _inline_md_to_html(banner_inner).replace(
+            "&lt;redacted&gt;", "&lt;redacted&gt;"  # already entity-escaped via _inline
+        )
+        parts.append(f'<div class="banner-sanitize">&#128274; {banner_html}</div>')
 
     headline_complexity = report.complexity.total
-    parts.append(f'<blockquote>Headline: complexity <strong>{headline_complexity}/100</strong>, '
-                 f'<strong>{len(report.pillars)}</strong> pillar cell(s), '
-                 f'<strong>{len(report.smells)}</strong> smell finding(s).<br>'
-                 'Tier 1 audit. Pure static analysis — no AI, no Excel, '
-                 "no macro execution. Same input always produces the same output. "
-                 "Findings ranked, not interpreted.</blockquote>")
+    headline = t("cover.headline", lang,
+                 complexity=f"<strong>{headline_complexity}/100</strong>",
+                 pillar_count=f"<strong>{len(report.pillars)}</strong>",
+                 smell_count=f"<strong>{len(report.smells)}</strong>")
+    sub1 = t("cover.subline_1", lang)
+    sub2 = t("cover.subline_2", lang)
+    parts.append(f"<blockquote>{headline}<br>{sub1} {sub2}</blockquote>")
 
     # Pyramid order:
-    parts.append(_html_exec_summary(report))
-    parts.append(_html_toc(report))
-    parts.append(_html_workflow_guide(report))
-    parts.append(_html_data_flow_story(report))
-    parts.append(_html_top_impact_findings(report))
-    parts.append(_html_vba_walkthrough(report))
+    parts.append(_html_exec_summary(report, lang))
+    parts.append(_html_toc(report, lang))
+    parts.append(_html_workflow_guide(report, lang))
+    parts.append(_html_data_flow_story(report, lang))
+    parts.append(_html_top_impact_findings(report, lang))
+    parts.append(_html_vba_walkthrough(report, lang))
     if _domain_findings_present(report):
-        parts.append(_html_domain_findings(report))
-    parts.append(_html_appendix(report))
-    parts.append(_html_glossary(report))
-    parts.append(_html_methodology(report))
+        parts.append(_html_domain_findings(report, lang))
+    parts.append(_html_appendix(report, lang))
+    parts.append(_html_glossary(report, lang))
+    parts.append(_html_methodology(report, lang))
 
     parts.append("</body></html>")
     return "".join(parts) + "\n"
