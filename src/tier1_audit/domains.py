@@ -56,8 +56,12 @@ DOMAIN_TEMPLATES = {
     "logistics-routing": {
         "match_domain_names": ["logistics-routing"],
         "business_friendly_name": "Logistics — Vehicle Routing",
-        "keywords": ["route", "vehicle", "dispatch", "shipment", "delivery",
-                     "配送", "运输", "carrier", "lane", "freight"],
+        # Plurals included so `\b...\b` keyword matching catches the typical
+        # sheet names ("Routes", "Vehicles", "Shipments").
+        "keywords": ["route", "routes", "vehicle", "vehicles", "dispatch",
+                     "shipment", "shipments", "delivery", "deliveries",
+                     "配送", "运输", "carrier", "carriers", "lane", "lanes",
+                     "freight"],
         "common_sheet_roles": {
             "Routes": "route definitions",
             "Vehicles": "fleet master data",
@@ -80,8 +84,10 @@ DOMAIN_TEMPLATES = {
     "inventory-supply-chain": {
         "match_domain_names": ["inventory-supply-chain"],
         "business_friendly_name": "Inventory — Supply Chain",
-        "keywords": ["inventory", "stock", "reorder", "safety stock", "库存",
-                     "lead time", "供应商", "supplier", "EOQ", "ABC"],
+        # Plurals + a few more concrete sheet roles for word-boundary matching.
+        "keywords": ["inventory", "stock", "reorder", "safety stock", "EOQ",
+                     "movement", "movements", "supplier", "suppliers",
+                     "库存", "lead time", "供应商", "ABC"],
         "common_sheet_roles": {
             "Inventory": "current stock per SKU",
             "Suppliers": "supplier master with lead times",

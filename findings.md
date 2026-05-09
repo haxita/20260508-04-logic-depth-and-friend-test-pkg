@@ -202,3 +202,29 @@ web-API boilerplate, no business signal).
 default switched to `pip install .`. `requires-python>=3.9` works because
 all files have `from __future__ import annotations`. Friend doc gains
 4 install paths + troubleshooting table.
+
+## Round 4 — Test corpus expansion (2026-05-09)
+
+**3 new fixtures** via `tests/fixtures/build_corpus.py` (seed=20260509,
+stdlib + openpyxl only):
+
+| Fixture | Size | Domain (conf) | Buttons | Pillars | Complexity |
+|---|---|---|---|---|---|
+| logistics_routing_synth | 427 KB | `logistics-routing` (medium) | 1 | 4 | 68 |
+| inventory_supply_synth | 429 KB | `inventory-supply-chain` (medium) | 0 | 1 | 72 |
+| minimal_no_vba | 6 KB | `unknown` (none) | 0 | 0 | 32 |
+
+**Two latent bugs surfaced**: (a) `\b…\b` keyword regex missed plural
+sheet names — logistics detected as `unknown`. Fixed by adding plurals
+to `DOMAINS` + `domains.py`. (b) `_build_sheet_id_map` corrupted paths
+when `workbook.xml.rels` had leading-slash Targets — buttons invisible.
+Fixed by normalizing target paths.
+
+**Honest surprises**: minimal complexity = 32 (not ~10) because
+smell-density caps at 20/20 on small N — kept honest, not tuned.
+Inventory pillars = 1 (Movements!B label column wins by fan-in, not by
+EOQ semantic significance — Track-A failure mode for Tier 1.5).
+
+**Pytest**: 51/51 passing (27 baseline + 24 new). All 6 corpora pass:
+idempotent, zero-LLM, consistent H2 skeleton (`Domain-Specific Findings`
+correctly conditional). `docs/test-corpus.md` = canonical baseline.

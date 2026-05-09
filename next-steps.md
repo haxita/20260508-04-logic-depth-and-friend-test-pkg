@@ -166,3 +166,18 @@ The friend will likely report one of four things:
   for governance scores ("change-blast-radius: 80 formulas, hidden-logic
   load: 2 veryHidden sheets"). Data already in `report.*`; Tier 2 is
   presentation, not new analysis.
+
+## Round 4 forward-looking notes (2026-05-09)
+
+- **Keyword grooming**: plural-forms patch was reactive; sweep
+  `Order/Orders`, `Customer/Customers` etc. pre-friend-test (5 min).
+- **Stripped donor for tiny fixtures**: inventory ballooned to 429 KB
+  because of full donor blob. A 1-2-module mini-donor would shrink to
+  ~80 KB. Defer until a friend complains.
+- **Pillar significance vs fan-in**: EOQ cells are semantically critical
+  but each is referenced once — never picked as pillars. Track-A floor;
+  Tier 1.5 LLM "explain this formula" pass fixes this. Pitch honestly.
+- **Cross-template low-conf hits**: cap-planning now triggers
+  `inventory-supply-chain` at "low" via 供应商/库存. Could raise template
+  threshold 2→3 keywords or hide "low" in markdown. Defer until friends
+  say "bloat". More signal beats less.

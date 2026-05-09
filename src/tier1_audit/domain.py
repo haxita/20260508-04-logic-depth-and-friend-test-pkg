@@ -24,18 +24,24 @@ from dataclasses import dataclass
 
 
 # Each value is a list of keywords. Add liberally; word-boundary keeps it sane.
+# Plural forms are listed alongside singular because real-world sheets
+# typically use plural ("Routes", "Vehicles") and `\b...\b` does not match a
+# substring across word characters.
 DOMAINS = {
     "capacity-planning": [
         "BOM", "MRP", "MPS", "产能", "排产", "工序", "shift", "throughput",
         "capacity", "工时", "节拍",
     ],
     "logistics-routing": [
-        "route", "vehicle", "dispatch", "shipment", "delivery",
-        "配送", "运输", "TMS",
+        "route", "routes", "vehicle", "vehicles", "dispatch", "shipment",
+        "shipments", "delivery", "deliveries", "fleet", "carrier", "carriers",
+        "lane", "lanes", "freight",
+        "配送", "运输", "TMS", "车辆", "路径", "线路",
     ],
     "inventory-supply-chain": [
-        "inventory", "stock", "reorder", "safety stock",
-        "库存", "lead time", "供应商", "supplier", "采购",
+        "inventory", "stock", "reorder", "safety stock", "EOQ",
+        "movements", "movement", "supplier", "suppliers",
+        "库存", "lead time", "供应商", "采购", "安全库存", "在库",
     ],
     "operations-s&op": [
         "forecast", "demand", "sales", "revenue", "season", "S&OP",

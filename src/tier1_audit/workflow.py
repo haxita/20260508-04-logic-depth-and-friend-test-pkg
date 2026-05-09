@@ -182,8 +182,15 @@ def _build_sheet_id_map(zf: zipfile.ZipFile) -> dict:
         rid = rid_m.group(1)
         target = rid_to_target.get(rid, "")
         if target:
-            full_path = "xl/" + target if not target.startswith("xl/") else target
-            mapping[full_path] = sheet_name
+            # Targets in workbook.xml.rels can arrive in three shapes:
+            #   "/xl/worksheets/sheet1.xml" (absolute, leading slash)
+            #   "xl/worksheets/sheet1.xml" (relative-from-root)
+            #   "worksheets/sheet1.xml"    (relative-from-xl)
+            # Normalize to the in-zip key "xl/worksheets/sheetN.xml".
+            tg = target.lstrip("/")
+            if not tg.startswith("xl/"):
+                tg = "xl/" + tg
+            mapping[tg] = sheet_name
     return mapping
 
 
